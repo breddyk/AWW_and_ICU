@@ -135,7 +135,7 @@ The notebook is deliberately written to be transparent and hackable, so you can 
 ## Licences and attribution
 
 - Top-level repository: MIT License (see `LICENSE` in the repository root).
-- `NBPMscape/`: MIT-licensed Julia package; see `NBPMscape/LICENSE` and the upstream project documentation at  
+- `NBPMscape/`: MIT-licensed Julia package by Kieran Drake; see `NBPMscape/LICENSE` and the upstream project documentation at  
   `https://github.com/emvolz/NBPMscape.jl`.
 - `pgfgleam/`: MIT-licensed Python package by Guillaume St-Onge; see `pgfgleam/LICENSE`.
 

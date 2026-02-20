@@ -1,16 +1,10 @@
-#!/usr/bin/env julia
-
-# Load NBPMscape ONLY on main process (avoid Plots conflicts on workers)
 using Pkg
 Pkg.activate("/home/users/breddyk/AWW_and_ICU/NBPMscape")
 using NBPMscape
 using Printf
 using Distributed
 
-println("="^80)
-println("CALIBRATING INFECTIVITY VALUES FOR TARGET R0 VALUES")
-println("="^80)
-println()
+# This is to identify the scaling for R0 variation
 
 # Target R0 values for our simulations
 target_R0_values = [1.5, 2.0, 2.5, 3.0]
@@ -69,22 +63,6 @@ for R0 in target_R0_values
 end
 println()
 
-# Summary recommendation
-println("="^80)
-println("RECOMMENDATION FOR YOUR SIMULATION CODE:")
-println("="^80)
-println()
-println("Replace this code:")
-println("```julia")
-println("baseline_R0 = 2.0")
-println("infectivity_scaling = (R0 / baseline_R0) * NBPMscape.P.infectivity")
-println("```")
-println()
-println("With this lookup table:")
-println("```julia")
-println("# Calibrated infectivity values (verified via NBPMscape.infectivitytoR)")
-println("# Simulated with nsims=5000")
-println("infectivity_for_R0 = Dict(")
 for R0 in sort(target_R0_values)
     inf_val = verified_dict[R0].infectivity
     actual = verified_dict[R0].actual_R0
