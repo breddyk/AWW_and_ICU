@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+env/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Julia
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+
+# Local virtualenv in this repo
+wastewater_venv/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Large data / results (edit as needed)
+pgfgleam/datasets/*.csv
+pgfgleam/daily_imports_sensitivity*.csv
+
+
