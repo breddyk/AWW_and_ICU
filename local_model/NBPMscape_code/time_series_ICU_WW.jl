@@ -299,7 +299,7 @@ function run_timeseries_simulations(
     extra_time::Float64 = 45.0,
     icu_sampling_proportion::Float64 = 0.10,
     airport_detection_prob::Float64 = 0.08,  # 16% base × 50% sampling
-    output_dir::String = "/Users/reddy/AWW_and_ICU/pgfgleam/datasets/timeseries"
+    output_dir::String = "AWW_and_ICU/pgfgleam/datasets/timeseries"
 )
     """
     Run time series simulations for specified countries and parameters
@@ -445,7 +445,7 @@ R0_val = 2.0  # Specify R0
 gen_time_val = 4.0  # Specify generation time
 
 run_timeseries_simulations(
-    "/Users/reddy/AWW_and_ICU/pgfgleam/daily_imports_sensitivity_complete.csv",
+    "AWW_and_ICU/pgfgleam/daily_imports_sensitivity_complete.csv",
     selected_countries,
     R0_val,
     gen_time_val;
@@ -454,7 +454,7 @@ run_timeseries_simulations(
     extra_time = 45.0,
     icu_sampling_proportion = 0.10,
     airport_detection_prob = 0.08,  # 16% base × 50% sampling = 8%
-    output_dir = "/Users/reddy/AWW_and_ICU/pgfgleam/datasets/timeseries"
+    output_dir = "AWW_and_ICU/pgfgleam/datasets/timeseries"
 )
 
 println("\n✓ Time series simulations complete!")

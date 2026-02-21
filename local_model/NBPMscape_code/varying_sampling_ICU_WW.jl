@@ -438,12 +438,12 @@ end
 println("Starting sensitivity analysis...")
 
 results = run_sensitivity_analysis(
-    "/Users/reddy/AWW_and_ICU/pgfgleam/daily_imports_specific_sensitivity_gamma.csv",
+    "AWW_and_ICU/pgfgleam/daily_imports_specific_sensitivity_gamma.csv",
     ["Congo", "South Korea", "Switzerland"];
     num_samples = 100,
     turnaround_time = 3.0,
     time_buffer = 45.0,
-    output_path = "/Users/reddy/AWW_and_ICU/pgfgleam/pgfgleam/datasets/varying_sampling_params.csv",
+    output_path = "AWW_and_ICU/pgfgleam/pgfgleam/datasets/varying_sampling_params.csv",
     R0_values = [2.0],
     generation_times = [4.0],
     airport_probs = 0.01:0.01:1.0,

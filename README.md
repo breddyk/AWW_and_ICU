@@ -44,7 +44,7 @@ Pkg.instantiate()
 Or from the shell:
 
 ```bash
-cd /Users/reddy/AWW_and_ICU/NBPMscape
+cd AWW_and_ICU/NBPMscape
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 ```
 
@@ -55,7 +55,7 @@ This sets up all Julia dependencies required for the ICU + wastewater simulation
 From the shell:
 
 ```bash
-cd /Users/reddy/AWW_and_ICU/pgfgleam
+cd AWW_and_ICU/pgfgleam
 python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install --upgrade pip
@@ -98,7 +98,7 @@ Once `daily_imports_sensitivity.csv` is prepared, run the ICU + wastewater simul
 From the shell:
 
 ```bash
-cd /Users/reddy/AWW_and_ICU/NBPMscape
+cd AWW_and_ICU/NBPMscape
 julia --project=. AWW_ICU_examples/full_ICU_WW.jl
 ```
 
