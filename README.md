@@ -12,21 +12,21 @@ The repository is organised so that you can:
 
 - Reproduce the analyses from the paper (airport wastewater vs ICU).
 - Plug in your own epidemiological parameters and your own mobility/network data.
-- Run the ICU + wastewater detection simulations and export results similar to those produced by `full_ICU_WW.jl`.
+- Run the ICU + wastewater detection simulations and export results.
 
 
 ## Repository layout
 
-- `NBPMscape/` – Julia package and examples for transmission and ICU surveillance modelling.
+- `local_model/` – Julia package and examples for transmission and ICU surveillance modelling.
   - `src/` – core NBPMscape.jl code.
-  - `AWW_ICU_examples/` – ICU + wastewater examples, including `full_ICU_WW.jl`.
+  - `NBPMscape_code/` – ICU + AWW examples.
   - `parameters.md` – detailed description of model parameters and literature sources.
-- `pgfgleam/` – Python package and notebooks for global mobility and arrival modelling.
-  - `pgfgleam/` – Python library code and datasets.
-  - `data_processing.py` – helpers for preparing mobility data.
+- `global_model/` – Python package and notebooks for global mobility and arrival modelling.
+  - `pgfgleam_code/` – Python library code and datasets.
+  - `data_processing.py` – helpers for preparing our mobility data.
   - `simple_setup.ipynb` – user-facing notebook to plug in your own parameters and mobility data.
   - `figure*.ipynb`, `supp_*.ipynb` – analysis and plotting notebooks.
-- `wastewater_venv/` – optional local Python virtual environment (not needed on GitHub; you can create your own).
+  - `global_model.ipynb` - setup and creation of CSVs for local_model usage
 
 
 ## Installation

@@ -3,7 +3,7 @@ from .std_pgf import *
 from .sentinel_pgf import *
 from .sentinel2_pgf import *
 from .sentinel3_pgf import *
-from .sentinel4_pgf import *
+from .seeding_pgf import *
 from .cumulant import *
 from .dist import *
 from .utils import *
