@@ -1,0 +1,17 @@
+# Core dependencies (from setup.py)
+numpy==2.0.2
+pandas==2.3.3
+scipy==1.13.1
+ray==2.49.2
+
+# Visualization
+matplotlib==3.9.4
+seaborn==0.13.2
+
+# Additional dependencies used in notebooks
+tqdm==4.67.1
+geopandas==1.0.1
+
+# Optional but recommended for Jupyter notebooks
+ipywidgets>=8.0.0
+
