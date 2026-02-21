@@ -19,7 +19,7 @@ The repository is organised so that you can:
 
 - `local_model/` – Julia package and examples for transmission and ICU surveillance modelling.
   - `src/` – core NBPMscape.jl code.
-  - `NBPMscape_code/` – ICU + AWW examples.
+  - `NBPMscape/` – ICU + AWW examples.
   - `parameters.md` – detailed description of model parameters and literature sources.
 - `global_model/` – Python package and notebooks for global mobility and arrival modelling.
   - `pgfgleam_code/` – Python library code and datasets.
@@ -33,7 +33,7 @@ The repository is organised so that you can:
 
 You will need Julia (≥ 1.9 is recommended) and Python (≥ 3.9).
 
-### Julia environment for NBPMscape
+### Julia environment for local_model & NBPMscape
 
 ```julia
 using Pkg
@@ -44,18 +44,18 @@ Pkg.instantiate()
 Or from the shell:
 
 ```bash
-cd AWW_and_ICU/NBPMscape
+cd local_model/NBPMscape
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 ```
 
 This sets up all Julia dependencies required for the ICU + wastewater simulations.
 
-### Python environment for pgfgleam
+### Python environment for global_model & pgfgleam
 
 From the shell:
 
 ```bash
-cd AWW_and_ICU/pgfgleam
+cd AWW_and_ICU/global_model
 python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install --upgrade pip
@@ -64,49 +64,45 @@ pip install -e .
 
 The editable install (`-e .`) makes the `pgfgleam` package and helper scripts (including `data_processing.py`) importable inside notebooks.
 
-If you prefer, you can reuse the existing `wastewater_venv/` environment instead of creating `.venv`.
-
-
 ## Quick start: run the ICU + wastewater workflow
 
 The end-to-end ICU + wastewater workflow proceeds in two broad stages:
 
-1. Prepare daily import trajectories for each country and parameter combination (Python, `pgfgleam`).
-2. Run ICU + wastewater detection simulations on those import trajectories (Julia, `NBPMscape`).
+1. Prepare daily import trajectories for each country and parameter combination (Python).
+2. Run ICU + wastewater detection simulations on those import trajectories (Julia).
 
-### 1. Prepare daily imports with `pgfgleam`
+### 1. Prepare daily imports
 
 Open the notebook:
 
-- `pgfgleam/simple_setup.ipynb`
+- `global_model/simple_setup.ipynb`
 
 In this notebook you can:
 
 - Point to your own mobility / flight matrix, population data, and country-code mappings (via `DataSetup` in `data_processing.py`).
 - Specify epidemiological parameters (e.g. $R_0$, generation time, infectious period).
-- Generate a CSV of daily introduction trajectories in the format expected by the ICU + wastewater workflow (by default saved as:
-  - `pgfgleam/daily_imports_sensitivity.csv`).
+- Generate a CSV of daily introduction trajectories in the format expected by the ICU + wastewater workflow
 
-You can also start from the existing `daily_imports_sensitivity.csv` in `pgfgleam/` as a template and adjust it.
+You can also start from the existing `daily_imports_sensitivity.csv` in ``AWW_and_ICU/global_model/pgfgleam_code/all_results/global/` as a template and adjust it.
 
 ### 2. Run ICU + wastewater simulations with Julia
 
 Once `daily_imports_sensitivity.csv` is prepared, run the ICU + wastewater simulations using:
 
-- `NBPMscape/AWW_ICU_examples/full_ICU_WW.jl`
+- `local_model/NBPMscape/full_ICU_WW.jl`
 
 From the shell:
 
 ```bash
-cd AWW_and_ICU/NBPMscape
-julia --project=. AWW_ICU_examples/full_ICU_WW.jl
+cd AWW_and_ICU/local_model
+julia --project=. NBPMscape/full_ICU_WW.jl
 ```
 
 In its current configuration, this script:
 
-- Reads the merged imports CSV (by default `pgfgleam/daily_imports_sensitivity.csv`).
+- Reads the merged imports CSV (by default `AWW_and_ICU/global_model/pgfgleam_code/all_results/global/daily_imports_sensitivity.csv`).
 - Runs the ICU-based detection and airport wastewater detection simulations across a grid of parameters.
-- Periodically saves results to a CSV in `pgfgleam/datasets/` (e.g. `full_result.csv`), which you can analyse in R, Python, or Julia.
+- Periodically saves results to a CSV in `AWW_and_ICU/global_model/pgfgleam_code/all_results/local` (e.g. `full_result.csv`), which you can analyse in R, Python, or Julia.
 
 The script uses a batched, parallelised simulation strategy (see the top of `full_ICU_WW.jl` for details and resource requirements, particularly `addprocs(…)`).
 
@@ -137,12 +133,12 @@ The notebook is deliberately written to be transparent and hackable, so you can 
 - Top-level repository: MIT License (see `LICENSE` in the repository root).
 - `NBPMscape/`: MIT-licensed Julia package by Kieran Drake; see `NBPMscape/LICENSE` and the upstream project documentation at  
   `https://github.com/emvolz/NBPMscape.jl`.
-- `pgfgleam/`: MIT-licensed Python package by Guillaume St-Onge; see `pgfgleam/LICENSE`.
+- `pgfgleam/`: MIT-licensed Python package by Guillaume St-Onge; see `pgfgleam_code/LICENSE`.
 
 If you use this repository in academic work, please:
 
 - Cite the NBPMscape and pgfgleam projects as appropriate.
-- Cite the epidemiological and methodological references listed in `NBPMscape/parameters.md`.
+- Cite the epidemiological and methodological references listed in `AWW_and_ICU/local_model/parameters.md`.
 
 
 ## Reproducibility notes
