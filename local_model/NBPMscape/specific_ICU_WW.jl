@@ -1001,13 +1001,13 @@ end
 selected_countries = ["Ghana", "Nigeria", "South Africa", "Kenya", "Egypt"]  # Example list
 
 results = run_simulations_from_merged_csv(
-    "AWW_and_ICU/pgfgleam/daily_imports_sensitivity_complete.csv";
+    "global_model/pgfgleam_code/all_results/global/daily_imports_sensitivity_complete.csv";
     num_samples = 100,
     turnaround_time = 3.0,
     max_detection_time_threshold = 200.0,
     extra_time = 45.0,
     icu_sampling_proportion = 0.10,
-    output_path = "AWW_and_ICU/pgfgleam/datasets/full_result_selected_countries.csv",
+    output_path = "global_model/pgfgleam_code/all_results/local/datasets/full_result_selected_countries.csv",
     batch_size = 200,
     selected_countries = selected_countries  # Add this parameter
 )
