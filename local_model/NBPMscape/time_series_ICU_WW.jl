@@ -445,7 +445,7 @@ R0_val = 2.0  # Specify R0
 gen_time_val = 4.0  # Specify generation time
 
 run_timeseries_simulations(
-    "global_model/pgfgleam_code/all_results/global/daily_imports_sensitivity.csv",
+    "global_model/pgfgleam/all_results/global/daily_imports_sensitivity.csv",
     selected_countries,
     R0_val,
     gen_time_val;
@@ -454,7 +454,7 @@ run_timeseries_simulations(
     extra_time = 45.0,
     icu_sampling_proportion = 0.10,
     airport_detection_prob = 0.08,  # 16% base × 50% sampling = 8%
-    output_dir = "global_model/pgfgleam_code/all_results/local/timeseries"
+    output_dir = "global_model/pgfgleam/all_results/local/timeseries"
 )
 
 println("\n✓ Time series simulations complete!")

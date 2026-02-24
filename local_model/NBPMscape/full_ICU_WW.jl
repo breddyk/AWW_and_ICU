@@ -47,7 +47,7 @@ end
     Args:
         country_data: DataFrame with import data
         sample_id: Sample identifier
-        import_column: Either :daily_transmission_capable_imports or :daily_detectable_imports
+        import_column: Either :daily_latent_imports, :daily_infectious_imports, or :daily_detectable_imports
     
     Returns: Vector of daily import counts (integers) and total imports for this sample
     """
@@ -94,7 +94,9 @@ end
     Simulate both ICU and WW detection with CORRECT import types
     
     KEY: 
-    - Seeding local transmission uses daily_transmission_capable_imports (L + I)
+    - Seeding local transmission uses:
+      * daily_latent_imports (L) - starts from latent period (normal seeding)
+      * daily_infectious_imports (I) - starts immediately infectious (no latent period)
     - Airport detection uses daily_detectable_imports (I + P)
     """
     
@@ -152,7 +154,8 @@ end
         )
     end
     
-    transmission_imports_per_sample = Float64[]
+    latent_imports_per_sample = Float64[]
+    infectious_imports_per_sample = Float64[]
     detectable_imports_per_sample = Float64[]
     
     for sample in 1:num_samples
@@ -162,16 +165,23 @@ end
         end
         
         # ========================================
-        # KEY CHANGE: Sample TWO different import types
+        # KEY CHANGE: Sample THREE different import types
         # ========================================
         
-        # 1. Transmission-capable imports (L + I) - seeds local transmission
-        transmission_import_counts, total_transmission = sample_daily_imports_poisson(
-            country_data, sample, :daily_transmission_capable_imports
+        # 1. Latent imports (L) - seeds local transmission, starts from latent period
+        latent_import_counts, total_latent = sample_daily_imports_poisson(
+            country_data, sample, :daily_latent_imports
         )
-        push!(transmission_imports_per_sample, total_transmission)
         
-        # 2. Detectable imports (I + P) - can trigger airport detection
+        # 2. Infectious imports (I) - seeds local transmission, starts immediately infectious
+        infectious_import_counts, total_infectious = sample_daily_imports_poisson(
+            country_data, sample, :daily_infectious_imports
+        )
+        
+        push!(latent_imports_per_sample, total_latent)
+        push!(infectious_imports_per_sample, total_infectious)
+        
+        # 3. Detectable imports (I + P) - can trigger airport detection
         detectable_import_counts, total_detectable = sample_daily_imports_poisson(
             country_data, sample, :daily_detectable_imports
         )
@@ -217,12 +227,45 @@ end
             end
             
             # ========================================
-            # LOCAL TRANSMISSION: Seeds from transmission-capable imports (L + I)
+            # LOCAL TRANSMISSION: Seeds from latent (L) and infectious (I) imports
             # ========================================
-            daily_transmission_count = transmission_import_counts[idx]
+            daily_latent_count = latent_import_counts[idx]
+            daily_infectious_count = infectious_import_counts[idx]
             
-            for j in 1:daily_transmission_count
+            # Process latent imports (L) - normal seeding (starts from midpoint of latent period)
+            for j in 1:daily_latent_count
                 results = NBPMscape.simtree(base_params,
+                    initialtime = Float64(time) - latent_period / 2.0,
+                    maxtime = max_observation_time,
+                    maxgenerations = 100,
+                    initialcontact = :G
+                )
+                
+                if nrow(results.G) > 0
+                    results.G[1, :generation] = 0
+                    results.G.import_event .= Int(time)
+                    results.G.import_time .= Float64(time)
+                    
+                    if isempty(sample_infections)
+                        sample_infections = results.G
+                    else
+                        append!(sample_infections, results.G)
+                    end
+                end
+            end
+            
+            # Process infectious imports (I) - start immediately infectious, and midway through (no latent period)
+            # Use modified parameters with essentially zero latent period
+            # Set latent_scale to very small value so laglatent ≈ 0, making tinfectious ≈ tinf
+            infectious_params = merge(base_params, (
+                latent_scale = 1e-6,
+                infectious_scale = (infectious_period / 2.0) / fixed_shape,  # Half infectious period remaining
+                latent_shape = fixed_shape
+            ))
+            
+            for j in 1:daily_infectious_count
+                # Start at arrival time, not before
+                results = NBPMscape.simtree(infectious_params,
                     initialtime = Float64(time),
                     maxtime = max_observation_time,
                     maxgenerations = 100,
@@ -233,6 +276,8 @@ end
                     results.G[1, :generation] = 0
                     results.G.import_event .= Int(time)
                     results.G.import_time .= Float64(time)
+                    # With very small latent_scale, tinfectious ≈ tinf (immediately infectious)
+                    # and tfin ≈ tinf + lagrecovery (no latent period in total duration)
                     
                     if isempty(sample_infections)
                         sample_infections = results.G
@@ -296,7 +341,8 @@ end
         end
         icu_pct = round(100*length(icu_detection_times)/num_samples, digits=1)
         println("    ICU=$icu_pct% detected")
-        println("    Mean transmission-capable imports/sample: $(round(mean(transmission_imports_per_sample), digits=2))")
+        println("    Mean latent imports/sample: $(round(mean(latent_imports_per_sample), digits=2))")
+        println("    Mean infectious imports/sample: $(round(mean(infectious_imports_per_sample), digits=2))")
         println("    Mean detectable imports/sample: $(round(mean(detectable_imports_per_sample), digits=2))")
     end
     
@@ -304,7 +350,8 @@ end
         icu_detection_times = icu_detection_times,
         icu_local_cases_at_detection = icu_local_cases_at_detection,
         airport_results = airport_results,
-        mean_transmission_imports_per_sample = mean(transmission_imports_per_sample),
+        mean_latent_imports_per_sample = mean(latent_imports_per_sample),
+        mean_infectious_imports_per_sample = mean(infectious_imports_per_sample),
         mean_detectable_imports_per_sample = mean(detectable_imports_per_sample)
     )
 end
@@ -320,10 +367,10 @@ function safe_csv_write(output_path::String, df::DataFrame)
     # Convert vector columns to strings
     df_to_save = copy(df)
     vector_cols = [:ICU_detection_times, :ICU_local_cases_samples, 
-                   :WW_004_10pct_detection_times, :WW_004_10pct_local_cases_samples,
-                   :WW_004_25pct_detection_times, :WW_004_25pct_local_cases_samples,
-                   :WW_004_50pct_detection_times, :WW_004_50pct_local_cases_samples,
-                   :WW_004_100pct_detection_times, :WW_004_100pct_local_cases_samples,
+                   :WW_008_10pct_detection_times, :WW_008_10pct_local_cases_samples,
+                   :WW_008_25pct_detection_times, :WW_008_25pct_local_cases_samples,
+                   :WW_008_50pct_detection_times, :WW_008_50pct_local_cases_samples,
+                   :WW_008_100pct_detection_times, :WW_008_100pct_local_cases_samples,
                    :WW_016_10pct_detection_times, :WW_016_10pct_local_cases_samples,
                    :WW_016_25pct_detection_times, :WW_016_25pct_local_cases_samples,
                    :WW_016_50pct_detection_times, :WW_016_50pct_local_cases_samples,
@@ -393,13 +440,13 @@ function run_simulations_from_merged_csv(
     Run WW + ICU simulations with multiple base p_det values and sampling fractions
     
     Airport detection model:
-    - base_pdet ∈ {0.04, 0.16} (per-flight detection probability)
+    - base_pdet ∈ {0.08, 0.16} (per-flight detection probability)
     - sampling_fraction ∈ {10%, 25%, 50%, 100%} (proportion of flights tested)
     - effective p_det = base_pdet × sampling_fraction
     
     This gives 8 WW configurations:
-    - base_pdet=0.04: 0.004, 0.01, 0.02, 0.04
-    - base_pdet=0.16: 0.016, 0.04, 0.08, 0.16
+    - base_pdet=0.08: 0.008, 0.01, 0.02, 0.08
+    - base_pdet=0.16: 0.016, 0.08, 0.08, 0.16
     
     Features:
     - Early stopping: Stops each sample when all detections occur
@@ -453,7 +500,13 @@ function run_simulations_from_merged_csv(
         row.mean_detection_time <= max_detection_time_threshold,
         param_combinations
     )
-    
+
+    # # Filter out R0 = 3, gen_time = 4.0
+    # valid_combinations = filter(row -> 
+    #     !(Float64(row.R0) == 3.0 && Float64(row.generation_time) == 4.0),
+    #     valid_combinations
+    # )
+
     println("After filtering: $(nrow(valid_combinations)) valid combinations")
     println("(Excluded $(nrow(param_combinations) - nrow(valid_combinations)) with mean_detection_time > $max_detection_time_threshold or missing)")
     
@@ -492,10 +545,10 @@ function run_simulations_from_merged_csv(
             
             # Parse the string representations back to vectors
             vector_cols = [:ICU_detection_times, :ICU_local_cases_samples, 
-                        :WW_004_10pct_detection_times, :WW_004_10pct_local_cases_samples,
-                        :WW_004_25pct_detection_times, :WW_004_25pct_local_cases_samples,
-                        :WW_004_50pct_detection_times, :WW_004_50pct_local_cases_samples,
-                        :WW_004_100pct_detection_times, :WW_004_100pct_local_cases_samples,
+                        :WW_008_10pct_detection_times, :WW_008_10pct_local_cases_samples,
+                        :WW_008_25pct_detection_times, :WW_008_25pct_local_cases_samples,
+                        :WW_008_50pct_detection_times, :WW_008_50pct_local_cases_samples,
+                        :WW_008_100pct_detection_times, :WW_008_100pct_local_cases_samples,
                         :WW_016_10pct_detection_times, :WW_016_10pct_local_cases_samples,
                         :WW_016_25pct_detection_times, :WW_016_25pct_local_cases_samples,
                         :WW_016_50pct_detection_times, :WW_016_50pct_local_cases_samples,
@@ -512,27 +565,27 @@ function run_simulations_from_merged_csv(
                 ICU_detection_times = Vector{Float64}[],
                 ICU_mean_local_cases = Float64[],
                 ICU_local_cases_samples = Vector{Float64}[],
-                # Base p_det = 0.04
-                WW_004_10pct_mean_detection_time = Float64[],
-                WW_004_10pct_detection_times = Vector{Float64}[],
-                WW_004_10pct_mean_local_cases = Float64[],
-                WW_004_10pct_local_cases_samples = Vector{Float64}[],
-                WW_004_10pct_detections = Int[],
-                WW_004_25pct_mean_detection_time = Float64[],
-                WW_004_25pct_detection_times = Vector{Float64}[],
-                WW_004_25pct_mean_local_cases = Float64[],
-                WW_004_25pct_local_cases_samples = Vector{Float64}[],
-                WW_004_25pct_detections = Int[],
-                WW_004_50pct_mean_detection_time = Float64[],
-                WW_004_50pct_detection_times = Vector{Float64}[],
-                WW_004_50pct_mean_local_cases = Float64[],
-                WW_004_50pct_local_cases_samples = Vector{Float64}[],
-                WW_004_50pct_detections = Int[],
-                WW_004_100pct_mean_detection_time = Float64[],
-                WW_004_100pct_detection_times = Vector{Float64}[],
-                WW_004_100pct_mean_local_cases = Float64[],
-                WW_004_100pct_local_cases_samples = Vector{Float64}[],
-                WW_004_100pct_detections = Int[],
+                # Base p_det = 0.08
+                WW_008_10pct_mean_detection_time = Float64[],
+                WW_008_10pct_detection_times = Vector{Float64}[],
+                WW_008_10pct_mean_local_cases = Float64[],
+                WW_008_10pct_local_cases_samples = Vector{Float64}[],
+                WW_008_10pct_detections = Int[],
+                WW_008_25pct_mean_detection_time = Float64[],
+                WW_008_25pct_detection_times = Vector{Float64}[],
+                WW_008_25pct_mean_local_cases = Float64[],
+                WW_008_25pct_local_cases_samples = Vector{Float64}[],
+                WW_008_25pct_detections = Int[],
+                WW_008_50pct_mean_detection_time = Float64[],
+                WW_008_50pct_detection_times = Vector{Float64}[],
+                WW_008_50pct_mean_local_cases = Float64[],
+                WW_008_50pct_local_cases_samples = Vector{Float64}[],
+                WW_008_50pct_detections = Int[],
+                WW_008_100pct_mean_detection_time = Float64[],
+                WW_008_100pct_detection_times = Vector{Float64}[],
+                WW_008_100pct_mean_local_cases = Float64[],
+                WW_008_100pct_local_cases_samples = Vector{Float64}[],
+                WW_008_100pct_detections = Int[],
                 # Base p_det = 0.16
                 WW_016_10pct_mean_detection_time = Float64[],
                 WW_016_10pct_detection_times = Vector{Float64}[],
@@ -554,7 +607,8 @@ function run_simulations_from_merged_csv(
                 WW_016_100pct_mean_local_cases = Float64[],
                 WW_016_100pct_local_cases_samples = Vector{Float64}[],
                 WW_016_100pct_detections = Int[],
-                mean_transmission_imports_per_sample = Float64[],
+                mean_latent_imports_per_sample = Float64[],
+                mean_infectious_imports_per_sample = Float64[],
                 mean_detectable_imports_per_sample = Float64[]
             )
             
@@ -570,27 +624,27 @@ function run_simulations_from_merged_csv(
                     ICU_detection_times = eval(Meta.parse(row.ICU_detection_times)),
                     ICU_mean_local_cases = row.ICU_mean_local_cases,
                     ICU_local_cases_samples = eval(Meta.parse(row.ICU_local_cases_samples)),
-                    # Base p_det = 0.04
-                    WW_004_10pct_mean_detection_time = row.WW_004_10pct_mean_detection_time,
-                    WW_004_10pct_detection_times = eval(Meta.parse(row.WW_004_10pct_detection_times)),
-                    WW_004_10pct_mean_local_cases = row.WW_004_10pct_mean_local_cases,
-                    WW_004_10pct_local_cases_samples = eval(Meta.parse(row.WW_004_10pct_local_cases_samples)),
-                    WW_004_10pct_detections = row.WW_004_10pct_detections,
-                    WW_004_25pct_mean_detection_time = row.WW_004_25pct_mean_detection_time,
-                    WW_004_25pct_detection_times = eval(Meta.parse(row.WW_004_25pct_detection_times)),
-                    WW_004_25pct_mean_local_cases = row.WW_004_25pct_mean_local_cases,
-                    WW_004_25pct_local_cases_samples = eval(Meta.parse(row.WW_004_25pct_local_cases_samples)),
-                    WW_004_25pct_detections = row.WW_004_25pct_detections,
-                    WW_004_50pct_mean_detection_time = row.WW_004_50pct_mean_detection_time,
-                    WW_004_50pct_detection_times = eval(Meta.parse(row.WW_004_50pct_detection_times)),
-                    WW_004_50pct_mean_local_cases = row.WW_004_50pct_mean_local_cases,
-                    WW_004_50pct_local_cases_samples = eval(Meta.parse(row.WW_004_50pct_local_cases_samples)),
-                    WW_004_50pct_detections = row.WW_004_50pct_detections,
-                    WW_004_100pct_mean_detection_time = row.WW_004_100pct_mean_detection_time,
-                    WW_004_100pct_detection_times = eval(Meta.parse(row.WW_004_100pct_detection_times)),
-                    WW_004_100pct_mean_local_cases = row.WW_004_100pct_mean_local_cases,
-                    WW_004_100pct_local_cases_samples = eval(Meta.parse(row.WW_004_100pct_local_cases_samples)),
-                    WW_004_100pct_detections = row.WW_004_100pct_detections,
+                    # Base p_det = 0.08
+                    WW_008_10pct_mean_detection_time = row.WW_008_10pct_mean_detection_time,
+                    WW_008_10pct_detection_times = eval(Meta.parse(row.WW_008_10pct_detection_times)),
+                    WW_008_10pct_mean_local_cases = row.WW_008_10pct_mean_local_cases,
+                    WW_008_10pct_local_cases_samples = eval(Meta.parse(row.WW_008_10pct_local_cases_samples)),
+                    WW_008_10pct_detections = row.WW_008_10pct_detections,
+                    WW_008_25pct_mean_detection_time = row.WW_008_25pct_mean_detection_time,
+                    WW_008_25pct_detection_times = eval(Meta.parse(row.WW_008_25pct_detection_times)),
+                    WW_008_25pct_mean_local_cases = row.WW_008_25pct_mean_local_cases,
+                    WW_008_25pct_local_cases_samples = eval(Meta.parse(row.WW_008_25pct_local_cases_samples)),
+                    WW_008_25pct_detections = row.WW_008_25pct_detections,
+                    WW_008_50pct_mean_detection_time = row.WW_008_50pct_mean_detection_time,
+                    WW_008_50pct_detection_times = eval(Meta.parse(row.WW_008_50pct_detection_times)),
+                    WW_008_50pct_mean_local_cases = row.WW_008_50pct_mean_local_cases,
+                    WW_008_50pct_local_cases_samples = eval(Meta.parse(row.WW_008_50pct_local_cases_samples)),
+                    WW_008_50pct_detections = row.WW_008_50pct_detections,
+                    WW_008_100pct_mean_detection_time = row.WW_008_100pct_mean_detection_time,
+                    WW_008_100pct_detection_times = eval(Meta.parse(row.WW_008_100pct_detection_times)),
+                    WW_008_100pct_mean_local_cases = row.WW_008_100pct_mean_local_cases,
+                    WW_008_100pct_local_cases_samples = eval(Meta.parse(row.WW_008_100pct_local_cases_samples)),
+                    WW_008_100pct_detections = row.WW_008_100pct_detections,
                     # Base p_det = 0.16
                     WW_016_10pct_mean_detection_time = row.WW_016_10pct_mean_detection_time,
                     WW_016_10pct_detection_times = eval(Meta.parse(row.WW_016_10pct_detection_times)),
@@ -612,7 +666,8 @@ function run_simulations_from_merged_csv(
                     WW_016_100pct_mean_local_cases = row.WW_016_100pct_mean_local_cases,
                     WW_016_100pct_local_cases_samples = eval(Meta.parse(row.WW_016_100pct_local_cases_samples)),
                     WW_016_100pct_detections = row.WW_016_100pct_detections,
-                    mean_transmission_imports_per_sample = row.mean_transmission_imports_per_sample,
+                    mean_latent_imports_per_sample = row.mean_latent_imports_per_sample,
+                    mean_infectious_imports_per_sample = row.mean_infectious_imports_per_sample,
                     mean_detectable_imports_per_sample = row.mean_detectable_imports_per_sample
                 ))
             end
@@ -640,27 +695,27 @@ function run_simulations_from_merged_csv(
                 ICU_detection_times = Vector{Float64}[],
                 ICU_mean_local_cases = Float64[],
                 ICU_local_cases_samples = Vector{Float64}[],
-                # Base p_det = 0.04
-                WW_004_10pct_mean_detection_time = Float64[],
-                WW_004_10pct_detection_times = Vector{Float64}[],
-                WW_004_10pct_mean_local_cases = Float64[],
-                WW_004_10pct_local_cases_samples = Vector{Float64}[],
-                WW_004_10pct_detections = Int[],
-                WW_004_25pct_mean_detection_time = Float64[],
-                WW_004_25pct_detection_times = Vector{Float64}[],
-                WW_004_25pct_mean_local_cases = Float64[],
-                WW_004_25pct_local_cases_samples = Vector{Float64}[],
-                WW_004_25pct_detections = Int[],
-                WW_004_50pct_mean_detection_time = Float64[],
-                WW_004_50pct_detection_times = Vector{Float64}[],
-                WW_004_50pct_mean_local_cases = Float64[],
-                WW_004_50pct_local_cases_samples = Vector{Float64}[],
-                WW_004_50pct_detections = Int[],
-                WW_004_100pct_mean_detection_time = Float64[],
-                WW_004_100pct_detection_times = Vector{Float64}[],
-                WW_004_100pct_mean_local_cases = Float64[],
-                WW_004_100pct_local_cases_samples = Vector{Float64}[],
-                WW_004_100pct_detections = Int[],
+                # Base p_det = 0.08
+                WW_008_10pct_mean_detection_time = Float64[],
+                WW_008_10pct_detection_times = Vector{Float64}[],
+                WW_008_10pct_mean_local_cases = Float64[],
+                WW_008_10pct_local_cases_samples = Vector{Float64}[],
+                WW_008_10pct_detections = Int[],
+                WW_008_25pct_mean_detection_time = Float64[],
+                WW_008_25pct_detection_times = Vector{Float64}[],
+                WW_008_25pct_mean_local_cases = Float64[],
+                WW_008_25pct_local_cases_samples = Vector{Float64}[],
+                WW_008_25pct_detections = Int[],
+                WW_008_50pct_mean_detection_time = Float64[],
+                WW_008_50pct_detection_times = Vector{Float64}[],
+                WW_008_50pct_mean_local_cases = Float64[],
+                WW_008_50pct_local_cases_samples = Vector{Float64}[],
+                WW_008_50pct_detections = Int[],
+                WW_008_100pct_mean_detection_time = Float64[],
+                WW_008_100pct_detection_times = Vector{Float64}[],
+                WW_008_100pct_mean_local_cases = Float64[],
+                WW_008_100pct_local_cases_samples = Vector{Float64}[],
+                WW_008_100pct_detections = Int[],
                 # Base p_det = 0.16
                 WW_016_10pct_mean_detection_time = Float64[],
                 WW_016_10pct_detection_times = Vector{Float64}[],
@@ -682,7 +737,8 @@ function run_simulations_from_merged_csv(
                 WW_016_100pct_mean_local_cases = Float64[],
                 WW_016_100pct_local_cases_samples = Vector{Float64}[],
                 WW_016_100pct_detections = Int[],
-                mean_transmission_imports_per_sample = Float64[],
+                mean_latent_imports_per_sample = Float64[],
+                mean_infectious_imports_per_sample = Float64[],
                 mean_detectable_imports_per_sample = Float64[]
             )
         end
@@ -698,27 +754,27 @@ function run_simulations_from_merged_csv(
             ICU_detection_times = Vector{Float64}[],
             ICU_mean_local_cases = Float64[],
             ICU_local_cases_samples = Vector{Float64}[],
-            # Base p_det = 0.04
-            WW_004_10pct_mean_detection_time = Float64[],
-            WW_004_10pct_detection_times = Vector{Float64}[],
-            WW_004_10pct_mean_local_cases = Float64[],
-            WW_004_10pct_local_cases_samples = Vector{Float64}[],
-            WW_004_10pct_detections = Int[],
-            WW_004_25pct_mean_detection_time = Float64[],
-            WW_004_25pct_detection_times = Vector{Float64}[],
-            WW_004_25pct_mean_local_cases = Float64[],
-            WW_004_25pct_local_cases_samples = Vector{Float64}[],
-            WW_004_25pct_detections = Int[],
-            WW_004_50pct_mean_detection_time = Float64[],
-            WW_004_50pct_detection_times = Vector{Float64}[],
-            WW_004_50pct_mean_local_cases = Float64[],
-            WW_004_50pct_local_cases_samples = Vector{Float64}[],
-            WW_004_50pct_detections = Int[],
-            WW_004_100pct_mean_detection_time = Float64[],
-            WW_004_100pct_detection_times = Vector{Float64}[],
-            WW_004_100pct_mean_local_cases = Float64[],
-            WW_004_100pct_local_cases_samples = Vector{Float64}[],
-            WW_004_100pct_detections = Int[],
+            # Base p_det = 0.08
+            WW_008_10pct_mean_detection_time = Float64[],
+            WW_008_10pct_detection_times = Vector{Float64}[],
+            WW_008_10pct_mean_local_cases = Float64[],
+            WW_008_10pct_local_cases_samples = Vector{Float64}[],
+            WW_008_10pct_detections = Int[],
+            WW_008_25pct_mean_detection_time = Float64[],
+            WW_008_25pct_detection_times = Vector{Float64}[],
+            WW_008_25pct_mean_local_cases = Float64[],
+            WW_008_25pct_local_cases_samples = Vector{Float64}[],
+            WW_008_25pct_detections = Int[],
+            WW_008_50pct_mean_detection_time = Float64[],
+            WW_008_50pct_detection_times = Vector{Float64}[],
+            WW_008_50pct_mean_local_cases = Float64[],
+            WW_008_50pct_local_cases_samples = Vector{Float64}[],
+            WW_008_50pct_detections = Int[],
+            WW_008_100pct_mean_detection_time = Float64[],
+            WW_008_100pct_detection_times = Vector{Float64}[],
+            WW_008_100pct_mean_local_cases = Float64[],
+            WW_008_100pct_local_cases_samples = Vector{Float64}[],
+            WW_008_100pct_detections = Int[],
             # Base p_det = 0.16
             WW_016_10pct_mean_detection_time = Float64[],
             WW_016_10pct_detection_times = Vector{Float64}[],
@@ -740,7 +796,8 @@ function run_simulations_from_merged_csv(
             WW_016_100pct_mean_local_cases = Float64[],
             WW_016_100pct_local_cases_samples = Vector{Float64}[],
             WW_016_100pct_detections = Int[],
-            mean_transmission_imports_per_sample = Float64[],
+            mean_latent_imports_per_sample = Float64[],
+            mean_infectious_imports_per_sample = Float64[],
             mean_detectable_imports_per_sample = Float64[]
         )
     end
@@ -759,10 +816,10 @@ function run_simulations_from_merged_csv(
     flush(stdout)
     
     # Airport detection model:
-    # - base_pdet ∈ {0.04, 0.16} (per-flight detection probability)
+    # - base_pdet ∈ {0.08, 0.16} (per-flight detection probability)
     # - sampling_fraction ∈ {10%, 25%, 50%, 100%} (proportion of flights tested)
     # - effective p_det = base_pdet × sampling_fraction
-    base_pdets = [0.04, 0.16]
+    base_pdets = [0.08, 0.16]
     sampling_fractions = [0.10, 0.25, 0.50, 1.0]  # 10%, 25%, 50%, 100%
     
     # Generate all combinations
@@ -771,9 +828,9 @@ function run_simulations_from_merged_csv(
     for base_pdet in base_pdets
         for sampling_frac in sampling_fractions
             push!(p_dets, base_pdet * sampling_frac)
-            # Format: base_pdet as percentage (e.g., 0.04 → "004", 0.16 → "016")
-            base_pct = Int(round(base_pdet * 100))  # 0.04 → 4, 0.16 → 16
-            base_str = lpad(string(base_pct), 3, '0')  # 4 → "004", 16 → "016"
+            # Format: base_pdet as percentage (e.g., 0.08 → "008", 0.16 → "016")
+            base_pct = Int(round(base_pdet * 100))  # 0.08 → 4, 0.16 → 16
+            base_str = lpad(string(base_pct), 3, '0')  # 4 → "008", 16 → "016"
             sampling_pct = Int(round(sampling_frac * 100))  # 0.10 → 10, 0.25 → 25
             pct_str = string(sampling_pct) * "pct"
             push!(config_labels, "$(base_str)_$(pct_str)")
@@ -888,30 +945,30 @@ function run_simulations_from_merged_csv(
                     ICU_detection_times = result.icu_detection_times,
                     ICU_mean_local_cases = icu_mean_cases,
                     ICU_local_cases_samples = result.icu_local_cases_at_detection,
-                    # Base p_det = 0.04, 10% sampling
-                    WW_004_10pct_mean_detection_time = ww_results_by_config["004_10pct"].mean_detection_time,
-                    WW_004_10pct_detection_times = ww_results_by_config["004_10pct"].detection_times,
-                    WW_004_10pct_mean_local_cases = ww_results_by_config["004_10pct"].mean_local_cases,
-                    WW_004_10pct_local_cases_samples = ww_results_by_config["004_10pct"].local_cases_samples,
-                    WW_004_10pct_detections = ww_results_by_config["004_10pct"].num_detections,
-                    # Base p_det = 0.04, 25% sampling
-                    WW_004_25pct_mean_detection_time = ww_results_by_config["004_25pct"].mean_detection_time,
-                    WW_004_25pct_detection_times = ww_results_by_config["004_25pct"].detection_times,
-                    WW_004_25pct_mean_local_cases = ww_results_by_config["004_25pct"].mean_local_cases,
-                    WW_004_25pct_local_cases_samples = ww_results_by_config["004_25pct"].local_cases_samples,
-                    WW_004_25pct_detections = ww_results_by_config["004_25pct"].num_detections,
-                    # Base p_det = 0.04, 50% sampling
-                    WW_004_50pct_mean_detection_time = ww_results_by_config["004_50pct"].mean_detection_time,
-                    WW_004_50pct_detection_times = ww_results_by_config["004_50pct"].detection_times,
-                    WW_004_50pct_mean_local_cases = ww_results_by_config["004_50pct"].mean_local_cases,
-                    WW_004_50pct_local_cases_samples = ww_results_by_config["004_50pct"].local_cases_samples,
-                    WW_004_50pct_detections = ww_results_by_config["004_50pct"].num_detections,
-                    # Base p_det = 0.04, 100% sampling
-                    WW_004_100pct_mean_detection_time = ww_results_by_config["004_100pct"].mean_detection_time,
-                    WW_004_100pct_detection_times = ww_results_by_config["004_100pct"].detection_times,
-                    WW_004_100pct_mean_local_cases = ww_results_by_config["004_100pct"].mean_local_cases,
-                    WW_004_100pct_local_cases_samples = ww_results_by_config["004_100pct"].local_cases_samples,
-                    WW_004_100pct_detections = ww_results_by_config["004_100pct"].num_detections,
+                    # Base p_det = 0.08, 10% sampling
+                    WW_008_10pct_mean_detection_time = ww_results_by_config["008_10pct"].mean_detection_time,
+                    WW_008_10pct_detection_times = ww_results_by_config["008_10pct"].detection_times,
+                    WW_008_10pct_mean_local_cases = ww_results_by_config["008_10pct"].mean_local_cases,
+                    WW_008_10pct_local_cases_samples = ww_results_by_config["008_10pct"].local_cases_samples,
+                    WW_008_10pct_detections = ww_results_by_config["008_10pct"].num_detections,
+                    # Base p_det = 0.08, 25% sampling
+                    WW_008_25pct_mean_detection_time = ww_results_by_config["008_25pct"].mean_detection_time,
+                    WW_008_25pct_detection_times = ww_results_by_config["008_25pct"].detection_times,
+                    WW_008_25pct_mean_local_cases = ww_results_by_config["008_25pct"].mean_local_cases,
+                    WW_008_25pct_local_cases_samples = ww_results_by_config["008_25pct"].local_cases_samples,
+                    WW_008_25pct_detections = ww_results_by_config["008_25pct"].num_detections,
+                    # Base p_det = 0.08, 50% sampling
+                    WW_008_50pct_mean_detection_time = ww_results_by_config["008_50pct"].mean_detection_time,
+                    WW_008_50pct_detection_times = ww_results_by_config["008_50pct"].detection_times,
+                    WW_008_50pct_mean_local_cases = ww_results_by_config["008_50pct"].mean_local_cases,
+                    WW_008_50pct_local_cases_samples = ww_results_by_config["008_50pct"].local_cases_samples,
+                    WW_008_50pct_detections = ww_results_by_config["008_50pct"].num_detections,
+                    # Base p_det = 0.08, 100% sampling
+                    WW_008_100pct_mean_detection_time = ww_results_by_config["008_100pct"].mean_detection_time,
+                    WW_008_100pct_detection_times = ww_results_by_config["008_100pct"].detection_times,
+                    WW_008_100pct_mean_local_cases = ww_results_by_config["008_100pct"].mean_local_cases,
+                    WW_008_100pct_local_cases_samples = ww_results_by_config["008_100pct"].local_cases_samples,
+                    WW_008_100pct_detections = ww_results_by_config["008_100pct"].num_detections,
                     # Base p_det = 0.16, 10% sampling
                     WW_016_10pct_mean_detection_time = ww_results_by_config["016_10pct"].mean_detection_time,
                     WW_016_10pct_detection_times = ww_results_by_config["016_10pct"].detection_times,
@@ -936,7 +993,8 @@ function run_simulations_from_merged_csv(
                     WW_016_100pct_mean_local_cases = ww_results_by_config["016_100pct"].mean_local_cases,
                     WW_016_100pct_local_cases_samples = ww_results_by_config["016_100pct"].local_cases_samples,
                     WW_016_100pct_detections = ww_results_by_config["016_100pct"].num_detections,
-                    mean_transmission_imports_per_sample = result.mean_transmission_imports_per_sample,
+                    mean_latent_imports_per_sample = result.mean_latent_imports_per_sample,
+                    mean_infectious_imports_per_sample = result.mean_infectious_imports_per_sample,
                     mean_detectable_imports_per_sample = result.mean_detectable_imports_per_sample
                 )
             catch e
@@ -983,18 +1041,18 @@ end
 
 # Resolve paths relative to the repository root so the script is portable
 project_root = normpath(joinpath(@__DIR__, "..", ".."))
-input_csv_path = joinpath(project_root, "pgfgleam", "daily_imports_sensitivity.csv")
-output_csv_path = joinpath(project_root, "pgfgleam", "datasets", "full_result.csv")
+input_csv_path = "global_model/pgfgleam/all_results/global/daily_imports_sensitivity.csv"
+output_csv_path = "global_model/pgfgleam/all_results/local/full_result.csv"
 
 results = run_simulations_from_merged_csv(
     input_csv_path;
     num_samples = 100,
     turnaround_time = 3.0,
     max_detection_time_threshold = 200.0,
-    extra_time = 45.0,
+    extra_time = 35.0,
     icu_sampling_proportion = 0.10,
     output_path = output_csv_path,
-    batch_size = 200
+    batch_size = 125
 )
 
 println("\n✓ WW + ICU simulations complete!")

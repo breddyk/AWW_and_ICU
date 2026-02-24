@@ -962,14 +962,14 @@ end
 # ============================================================================
 
 results = run_aww_t3_comparison(
-    "global_model/pgfgleam_code/all_results/global/daily_imports_sensitivity_T3.csv";
+    "global_model/pgfgleam/all_results/global/daily_imports_sensitivity_T3.csv";
     num_samples = 100,
     turnaround_time = 3.0,
     max_detection_time_threshold = 200.0,
     extra_time = 45.0,
     base_pdet = 0.16,
     sampling_fractions = [0.10, 0.25, 0.50, 1.0],
-    output_path = "global_model/pgfgleam_code/all_results/local/aww_t3_comparison_results.csv",
+    output_path = "global_model/pgfgleam/all_results/local/aww_t3_comparison_results.csv",
     batch_size = 200
 )
 

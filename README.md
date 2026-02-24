@@ -22,7 +22,7 @@ The repository is organised so that you can:
   - `NBPMscape/` – ICU + AWW examples.
   - `parameters.md` – detailed description of model parameters and literature sources.
 - `global_model/` – Python package and notebooks for global mobility and arrival modelling.
-  - `pgfgleam_code/` – Python library code and datasets.
+  - `pgfgleam/` – Python library code and datasets.
   - `data_processing.py` – helpers for preparing our mobility data.
   - `simple_setup.ipynb` – user-facing notebook to plug in your own parameters and mobility data.
   - `figure*.ipynb`, `supp_*.ipynb` – analysis and plotting notebooks.
@@ -73,17 +73,7 @@ The end-to-end ICU + wastewater workflow proceeds in two broad stages:
 
 ### 1. Prepare daily imports
 
-Open the notebook:
-
-- `global_model/simple_setup.ipynb`
-
-In this notebook you can:
-
-- Point to your own mobility / flight matrix, population data, and country-code mappings (via `DataSetup` in `data_processing.py`).
-- Specify epidemiological parameters (e.g. $R_0$, generation time, infectious period).
-- Generate a CSV of daily introduction trajectories in the format expected by the ICU + wastewater workflow
-
-You can also start from the existing `daily_imports_sensitivity.csv` in ``AWW_and_ICU/global_model/pgfgleam_code/all_results/global/` as a template and adjust it.
+You can start from the existing `daily_imports_sensitivity.csv` in ``AWW_and_ICU/global_model/pgfgleam/all_results/global/` as a template and adjust it, or reproduce the results by running the notebook: `global_model/global_model.ipynb`
 
 ### 2. Run ICU + wastewater simulations with Julia
 
@@ -100,16 +90,16 @@ julia --project=. NBPMscape/full_ICU_WW.jl
 
 In its current configuration, this script:
 
-- Reads the merged imports CSV (by default `AWW_and_ICU/global_model/pgfgleam_code/all_results/global/daily_imports_sensitivity.csv`).
+- Reads the merged imports CSV (by default `AWW_and_ICU/global_model/pgfgleam/all_results/global/daily_imports_sensitivity.csv`).
 - Runs the ICU-based detection and airport wastewater detection simulations across a grid of parameters.
-- Periodically saves results to a CSV in `AWW_and_ICU/global_model/pgfgleam_code/all_results/local` (e.g. `full_result.csv`), which you can analyse in R, Python, or Julia.
+- Periodically saves results to a CSV in `AWW_and_ICU/global_model/pgfgleam/all_results/local` (e.g. `full_result.csv`), which you can analyse in R, Python, or Julia.
 
 The script uses a batched, parallelised simulation strategy (see the top of `full_ICU_WW.jl` for details and resource requirements, particularly `addprocs(…)`).
 
 
 ## Using `simple_setup.ipynb` with your own data
 
-The `simple_setup.ipynb` notebook is meant to be the main entry point for external users. A typical workflow is:
+The `simple_setup.ipynb` notebook is meant to be the main entry point for external users using own datasets. A typical workflow is:
 
 1. Set paths to your data
    - Flight / mobility matrix (e.g. monthly flows between countries or regions).
@@ -117,6 +107,7 @@ The `simple_setup.ipynb` notebook is meant to be the main entry point for extern
    - Country code / name mapping file.
 2. Run the data-preparation cell
    - Uses the `DataSetup` class in `data_processing.py` to normalise flows by population and harmonise country names.
+   - This will need to be tweaked for your data.
 3. Choose epidemiological parameters
    - $R_0$ values, generation-time distributions, latent and infectious periods, ICU sampling fraction, etc.
    - These are documented with literature references in `NBPMscape/parameters.md`.
@@ -132,14 +123,13 @@ The notebook is deliberately written to be transparent and hackable, so you can 
 
 - Top-level repository: MIT License (see `LICENSE` in the repository root).
 - `NBPMscape/`: MIT-licensed Julia package by Kieran Drake; see `NBPMscape/LICENSE` and the upstream project documentation at  
-  `https://github.com/emvolz/NBPMscape.jl`.
-- `pgfgleam/`: MIT-licensed Python package by Guillaume St-Onge; see `pgfgleam_code/LICENSE`.
+  `https://github.com/emvolz/NBPMscape/`.
+- `pgfgleam/`: MIT-licensed Python package by Guillaume St-Onge; see `pgfgleam/LICENSE` and the upstream project documentation at  
+  `https://github.com/mobs-lab/pgfgleam/`.
 
-If you use this repository in academic work, please:
+If you use this repository in academic work, please also:
 
 - Cite the NBPMscape and pgfgleam projects as appropriate.
-- Cite the epidemiological and methodological references listed in `AWW_and_ICU/local_model/parameters.md`.
-
 
 ## Reproducibility notes
 

@@ -504,12 +504,12 @@ end
 # ============================================================================
 
 results = run_parameter_sweep_optimized(
-    "global_model/pgfgleam_code/all_results/global/daily_imports_specific_sensitivity_gamma.csv",
+    "global_model/pgfgleam/all_results/global/daily_imports_specific_sensitivity_gamma.csv",
     ["Paraguay", "South Korea", "Switzerland"];
     num_samples = 100,
     turnaround_time = 3.0,
     time_buffer = 60.0,
-    output_path = "global_model/pgfgleam_code/all_results/local/specific_results_with_gamma.csv",
+    output_path = "global_model/pgfgleam/all_results/local/specific_results_with_gamma.csv",
     R0_values = [1.5, 2.0, 2.5, 3.0],
     generation_times = [4.0, 6.0, 8.0, 10.0],
     airport_probs = [0.04, 0.08, 0.16],
