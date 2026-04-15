@@ -3,25 +3,27 @@ default(;lw = 4)
 const MAXDURATION = 180.0
 
 mutable struct Infection
-	pid::String # infection id 
+	pid::String # infection id
 	dpid::Union{String,Missing}
-	H::DataFrame # transmission linelist 
-	R::Int64 # number transmissions 
+	H::DataFrame # transmission linelist
+	R::Int64 # number transmissions
 	sol::Union{ODESolution,Nothing}
-	tinf::Float64 # time infected 
-	tgp::Float64 # time 
-	thospital::Float64 # time 
-	ticu::Float64 # time 
+	tinf::Float64 # time infected
+	tgp::Float64 # time GP visit
+	ted::Float64  # time Emergency Department (ED) visit
+	thospital::Float64 # time hospital admission
+	ticu::Float64 # time ICU admission
 	# tsampled::Float64 # time
-	# tseqdeposition::Float64 # time for sequencing + qc + bioninf 
-	trecovered::Float64 
+	# tseqdeposition::Float64 # time for sequencing + qc + bioninf
+	trecovered::Float64
+	tdeceased::Float64  # time of death (set to trecovered; no death model currently)
 	contacttype::Symbol # cause of infection
 	degree::Tuple{Int64,Int64,Float64}
 	iscommuter::Bool
 	initialregion::String
 	homeregion::String
 	commuteregion::String
-	initialdayofweek::Int # day 1-7 when infection ocurred 
+	initialdayofweek::Int # day 1-7 when infection ocurred
 	severity::Symbol
 	generation::Int64
 end
@@ -89,11 +91,13 @@ P = (
 	, propmild = 0.60 
 	, propsevere = 0.05
 
-	, gprate = 1/3 
-	, hospadmitrate = 1/4 # Docherty 2020 
+	, gprate = 1/3
+	, edrate = 1/5   # rate of ED visit for moderate_ED cases (days⁻¹)
+	, ped = 0.74     # proportion of moderate cases who attend ED (vs GP only)
+	, hospadmitrate = 1/4 # Docherty 2020
 	, icurate = 1/2.5 # Knock 2021
 
-	, psampled = .05  # prop sampled form icu 
+	, psampled = .05  # prop sampled from icu
 	, turnaroundtime = 3 #days
 
 	, commuterate = 2.0
@@ -223,20 +227,28 @@ function Infection(p; pid = "0", region="TLI3", tinf = 0.0, initialdow = 1, cont
 	end 
 
 	# time of main events 
-	tseq = Inf # time of sequencing 
-	ticu = Inf # icu admit 
-	tgp = Inf # gpu attend 
-	thospital = Inf # hospital admit 
-	tsampled = Inf # sampled 
-	tseqdeposition = Inf # sequence db 
+	tseq = Inf # time of sequencing
+	ticu = Inf # icu admit
+	tgp = Inf # gp attend
+	ted = Inf  # ED attend
+	thospital = Inf # hospital admit
+	tdeceased = Inf # time of death (set to trecovered at end; no death model)
+	tsampled = Inf # sampled
+	tseqdeposition = Inf # sequence db
 	trecovered = Inf # recovered/deceased/removed
 
 	# initial state of infection 
-	sampled = false 
-	carestage = :undiagnosed 
+	sampled = false
+	carestage = :undiagnosed
 	infstage = :latent # jump process will actually start with this :infectious
-	agegroup = :adult # TODO sample 
-	severity = StatsBase.wsample( SEVERITY, [p.propmild, 1-p.propmild-p.propsevere , p.propsevere]  )
+	agegroup = :adult # TODO sample
+	# Sample base severity then split moderate into ED vs GP subtype
+	_base_sev = StatsBase.wsample( SEVERITY, [p.propmild, 1-p.propmild-p.propsevere , p.propsevere]  )
+	severity = if _base_sev == :moderate
+		rand() < p.ped ? :moderate_ED : :moderate_GP
+	else
+		_base_sev
+	end
 
 	#cumulative transm 
 	R = 0 
@@ -325,13 +337,21 @@ function Infection(p; pid = "0", region="TLI3", tinf = 0.0, initialdow = 1, cont
 	# tseqdeposition = Inf # sequence db 
 	# trecovered = Inf # recovered/deceased/removed
 
-	## gp 
-	rategp(u,p,t) = ((carestage==:undiagnosed) & (severity in (:moderate,:severe))) ? p.gprate : 0.0 
-	aff_gp!(int) = begin 
-		carestage = :GP; 
-		tgp = int.t 
+	## gp (for moderate_GP and severe)
+	rategp(u,p,t) = ((carestage==:undiagnosed) & (severity in (:moderate_GP,:severe))) ? p.gprate : 0.0
+	aff_gp!(int) = begin
+		carestage = :GP;
+		tgp = int.t
 	end
 	j_gp = ConstantRateJump(rategp, aff_gp!)
+
+	## ed (for moderate_ED cases — Emergency Department visit)
+	rateed(u,p,t) = ((carestage==:undiagnosed) & (severity == :moderate_ED)) ? p.edrate : 0.0
+	aff_ed!(int) = begin
+		carestage = :ED
+		ted = int.t
+	end
+	j_ed = ConstantRateJump(rateed, aff_ed!)
 
 	## hospital TODO add hospital -> discharged rate 
 	ratehospital(u,p,t) = (( (carestage in (:undiagnosed,:GP)) & (severity in (:severe,)) )) ? p.hospadmitrate : 0.0 
@@ -402,9 +422,10 @@ function Infection(p; pid = "0", region="TLI3", tinf = 0.0, initialdow = 1, cont
 		, j_loseg
 		, j_transmf
 		, j_transmg
-		, j_transmh 
-		, j_gp 
-		, j_hospital 
+		, j_transmh
+		, j_gp
+		, j_ed
+		, j_hospital
 		, j_icu
 		# , j_migration
 		, j_commute
@@ -429,24 +450,26 @@ function Infection(p; pid = "0", region="TLI3", tinf = 0.0, initialdow = 1, cont
 
 	Infection(
 		pid
-		, isnothing(donor) ? missing : donor.pid 
-		, H 
+		, isnothing(donor) ? missing : donor.pid
+		, H
 		, R
-		, nothing #sol #nothing to save on memory 
+		, nothing #sol #nothing to save on memory
 		, tinf
 		, tgp
+		, ted
 		, thospital
-		, ticu 
-		# , tsampled 
-		# , tseqdeposition 
-		, trecovered 
+		, ticu
+		# , tsampled
+		# , tseqdeposition
+		, trecovered
+		, trecovered  # tdeceased: no death model, set equal to trecovered
 		, contacttype
 		, (flinks,glinks,hr)
-		, iscommuter 
+		, iscommuter
 		, initialregion
 		, homeregion
 		, commuteregion
-		, initialdow # day 1-7 when infection ocurred 
+		, initialdow # day 1-7 when infection ocurred
 		, severity
 		, isnothing(donor) ? 0 : donor.generation+1 # generation 
 	)
@@ -500,10 +523,10 @@ function simtree(p; region="TLI3", initialtime=0.0, maxtime=30.0, maxgenerations
 		DataFrame(dfargs, [:donor, :recipient, :timetransmission, :contacttype, :region]) :  
 		DataFrame([:donor => nothing, :recipient => nothing, :timetransmission => nothing, :contacttype => nothing, :region => nothing])
 		
-	dfargs1 = [(u.pid, u.tinf, u.tgp, u.thospital, u.ticu, u.trecovered, u.severity, u.iscommuter, u.homeregion, u.commuteregion, u.generation,
+	dfargs1 = [(u.pid, u.tinf, u.tgp, u.ted, u.thospital, u.ticu, u.trecovered, u.tdeceased, u.severity, u.iscommuter, u.homeregion, u.commuteregion, u.generation,
 				u.degree...) for u in G]
 	Gdf = DataFrame(dfargs1
-		, [:pid, :tinf, :tgp, :thospital, :ticu, :trecovered, :severity, :iscommuter, :homeregion, :commuteregion, :generation, :F, :G, :H ]
+		, [:pid, :tinf, :tgp, :ted, :thospital, :ticu, :trecovered, :tdeceased, :severity, :iscommuter, :homeregion, :commuteregion, :generation, :F, :G, :H ]
 	)
 	
 	H.simid .= simid 
