@@ -20,8 +20,9 @@ using StatsPlots
 using LaTeXStrings
 using KernelDensity
 using Distributed
+using Dates
 
-addprocs(45)
+addprocs(1)
 
 @everywhere begin
     using Pkg
@@ -1140,8 +1141,8 @@ end
 
 # Resolve paths relative to the repository root so the script is portable
 project_root = normpath(joinpath(@__DIR__, "..", ".."))
-input_csv_path = "global_model/pgfgleam/all_results/global/daily_imports_sensitivity.csv"
-output_csv_path = "global_model/pgfgleam/all_results/local/full_ICU_AWW_HARISS_result.csv"
+input_csv_path = "/Users/reddy/AWW_and_ICU/global_model/pgfgleam/all_results/global/daily_imports_sensitivity.csv"
+output_csv_path = "/Users/reddy/AWW_and_ICU/global_model/pgfgleam/all_results/local/full_ICU_AWW_HARISS_result.csv"
 
 results = run_simulations_from_merged_csv(
     input_csv_path;

@@ -135,7 +135,7 @@ function icu_td(; p = NBPMscape.P
     # and computing times to detection
     for s in 1:n_replicates
         #TEST
-        println("$(s) of $(n_replicates) replicates")
+        # println("$(s) of $(n_replicates) replicates")
 
         # Add simulation number to results df
         #TEST s=1
@@ -679,7 +679,7 @@ function secondary_care_td(; p = NBPMscape.P
     # and computing times to detection
     for s in 1:n_replicates # s=1
         #TEST
-        println("$(s) of $(n_replicates) replicates")
+        # println("$(s) of $(n_replicates) replicates")
 
         # Add simulation number to results df
         #TEST s=1
