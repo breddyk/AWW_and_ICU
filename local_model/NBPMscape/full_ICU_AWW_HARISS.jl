@@ -212,6 +212,7 @@ end
         first_icu_detection_time = Inf
         hariss_detected_this_sample = false
         first_hariss_detection_time = Inf
+        last_hariss_check_time = -Inf  # so the first HARISS check fires on day 0
         
         # Track WW detection for each p_det
         airport_detected = Dict{Float64, Bool}()
@@ -321,32 +322,44 @@ end
                 end
             end
 
-            # Check HARISS (secondary care) detection after processing this day's imports
-            if !hariss_detected_this_sample && !isempty(sample_infections)
+            # Check HARISS (secondary care) detection after processing this day's imports.
+            # Throttled to once per week per sample -- secondary_care_td simulates a full
+            # background-ARI hospital caseload for every call, so running it every day is
+            # prohibitively expensive and adds little granularity.
+            hariss_due = (time - last_hariss_check_time) >= 7.0 || time >= max_observation_time - 1.0
+            if !hariss_detected_this_sample && !isempty(sample_infections) && hariss_due
+                last_hariss_check_time = time
                 try
                     sims_for_hariss = sample_infections
                     if !(:simid in propertynames(sims_for_hariss))
                         sims_for_hariss = copy(sample_infections)
-                        sims_for_hariss.simid .= 1
+                        sims_for_hariss.simid .= "sim-$(sample)"
                     end
 
-                    hariss_result = NBPMscape.secondary_care_td(;
-                        p = base_params,
-                        sims = [(G = sims_for_hariss,)],
-                        n_hosp_samples_per_week = n_hosp_samples_per_week,
-                    )
+                    # secondary_care_td expects sims to be a Vector of infection DataFrames
+                    # (it indexes `fo = sims[s]` then `fo.ted`, `fo.thospital`, etc. directly).
+                    # It also emits a per-replicate `println` we suppress to keep output clean.
+                    hariss_result = redirect_stdout(devnull) do
+                        NBPMscape.secondary_care_td(;
+                            p = base_params,
+                            sims = [sims_for_hariss],
+                            n_hosp_samples_per_week = n_hosp_samples_per_week,
+                        )
+                    end
 
                     if nrow(hariss_result) > 0 && :SC_TD in propertynames(hariss_result)
                         sc_td_finite = filter(x -> !ismissing(x) && isfinite(x), hariss_result.SC_TD)
                         if !isempty(sc_td_finite)
-                            hariss_detected_this_sample = true
-                            first_hariss_detection_time = minimum(sc_td_finite)
+                            td_min = minimum(sc_td_finite)
+                            if td_min <= max_observation_time
+                                hariss_detected_this_sample = true
+                                first_hariss_detection_time = td_min
+                            end
                         end
                     end
                 catch hariss_err
-                    if verbose && sample <= 3
-                        println("    HARISS sampling skipped (day $time): $hariss_err")
-                    end
+                    # Report errors to stderr so they are not silently swallowed.
+                    @warn "HARISS sampling failed" country=country_name sample=sample day=time err=hariss_err
                 end
             end
 
