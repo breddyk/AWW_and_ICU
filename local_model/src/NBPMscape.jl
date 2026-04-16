@@ -128,7 +128,7 @@ P = (
     , pathogen_type                = "virus"
     , initial_dow                  = 1          # Sunday
     , n_hosp_samples_per_week      = 300
-    , turnaroundtime_hariss        = [2, 4]
+    , turnaroundtime_hariss        = [3, 3]      # fixed 3 day turnaround time just to be identical to other methods
     , hariss_courier_to_analysis   = 1.0
     , phl_collection_dow           = [2, 5]     # Monday and Thursday
     , phl_collection_time          = 0.5        # midday
@@ -156,7 +156,7 @@ P = (
       )
 
     # ── ICU / upstream sampling parameters ───────────────────────────────
-    , turnaroundtime_icu            = [2, 4]
+    , turnaroundtime_icu            = [3, 3]
     , p_sampled_icu                 = 0.05
     , icu_sample_type               = "number"
     , icu_site_stage                = "current"
