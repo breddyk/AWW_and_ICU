@@ -99,20 +99,29 @@ end
 # Parameters with config-file overrides applied.
 @everywhere const P_FROM_CONFIG = let
     p = apply_yaml_scalars(NBPMscape.P, CONFIG_DATA)
-    # Rebuild the ED ARI destination DataFrames from the (possibly updated)
-    # scalar proportions so `secondary_care_td` picks up any changes made in
-    # the YAML config (the scalars are `ed_ari_destinations_adult_p_*`).
+    # Rebuild the ED ARI destination DataFrames from the YAML config scalars.
+    # These scalars (`ed_ari_destinations_adult_p_discharged` etc.) exist in the
+    # YAML but NOT in NBPMscape.P, so apply_yaml_scalars skips them. Read them
+    # directly from the config dict, falling back to the existing DataFrame
+    # values in P.
+    cfg = get(CONFIG_DATA, "parameters", Dict())
+    default_adult = p.ed_ari_destinations_adult.proportion_of_attendances
+    default_child = p.ed_ari_destinations_child.proportion_of_attendances
     ed_adult = DataFrame(
         destination               = [:discharged, :short_stay, :longer_stay],
-        proportion_of_attendances = [p.ed_ari_destinations_adult_p_discharged,
-                                     p.ed_ari_destinations_adult_p_short_stay,
-                                     p.ed_ari_destinations_adult_p_longer_stay],
+        proportion_of_attendances = [
+            get(cfg, "ed_ari_destinations_adult_p_discharged",   default_adult[1]),
+            get(cfg, "ed_ari_destinations_adult_p_short_stay",   default_adult[2]),
+            get(cfg, "ed_ari_destinations_adult_p_longer_stay",  default_adult[3]),
+        ],
     )
     ed_child = DataFrame(
         destination               = [:discharged, :short_stay, :longer_stay],
-        proportion_of_attendances = [p.ed_ari_destinations_child_p_discharged,
-                                     p.ed_ari_destinations_child_p_short_stay,
-                                     p.ed_ari_destinations_child_p_longer_stay],
+        proportion_of_attendances = [
+            get(cfg, "ed_ari_destinations_child_p_discharged",   default_child[1]),
+            get(cfg, "ed_ari_destinations_child_p_short_stay",   default_child[2]),
+            get(cfg, "ed_ari_destinations_child_p_longer_stay",  default_child[3]),
+        ],
     )
     merge(p, (ed_ari_destinations_adult = ed_adult,
               ed_ari_destinations_child = ed_child))
