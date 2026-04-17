@@ -36,12 +36,15 @@ using KernelDensity
 using Distributed
 using Dates
 
+# Compute the absolute path to the project root (where Project.toml lives)
+# BEFORE spawning workers so it resolves on the main process. Workers receive
+# the string value, not the @__DIR__ expression.
+const _PROJECT_DIR = normpath(joinpath(@__DIR__, ".."))
+
 addprocs(1)
 
-@everywhere begin
-    using Pkg
-    Pkg.activate(".")
-end
+@everywhere using Pkg
+@everywhere Pkg.activate($_PROJECT_DIR)
 
 # Load packages on all workers
 @everywhere using NBPMscape
