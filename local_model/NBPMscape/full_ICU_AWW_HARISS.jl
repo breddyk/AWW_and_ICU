@@ -8,6 +8,20 @@
 # `NBPMscape.secondary_care_td`. Note: the `WW_*` column prefix is retained
 # for compatibility with the existing AWW analysis pipeline -- semantically
 # `WW_*` here denotes the airport wastewater channel (AWW).
+#
+# Parameter wiring
+# ----------------
+# All HARISS-related parameters (sample allocation, PHL collection days,
+# turnaround time, weekly sample budget, ARI background, etc.) are loaded
+# from the real YAML config under `local_model/config/` rather than being
+# hardcoded against the package's defaults in `NBPMscape.P`. The active
+# config is `config/outbreak_params_covid19_like.yaml`; switch to one of
+# the `config/HARISS/covid19_like_params_HARISS_*.yaml` scenarios by
+# changing `CONFIG_REL_PATH` below.
+#
+# Note: the underlying `data/hariss_nhs_trust_sampling_sites.csv` may still
+# contain dummy `DM*` codes -- replace with the real NHS Trust list to get
+# realistic geographic matching against `homeregion`.
 # ============================================================================
 
 using NBPMscape
@@ -37,6 +51,95 @@ end
 @everywhere using CSV
 
 default(fontfamily="Times New Roman")
+
+# ============================================================================
+# REAL CONFIG LOADING (must run on every worker so HARISS uses the same
+# parameters everywhere `simulate_country_detection` is invoked).
+# ============================================================================
+
+# Path to the YAML config -- relative to the NBPMscape package root so it
+# resolves the same way on every worker regardless of CWD.
+@everywhere const CONFIG_REL_PATH = "config/outbreak_params_covid19_like.yaml"
+
+@everywhere const CONFIG_ABS_PATH = joinpath(pkgdir(NBPMscape), CONFIG_REL_PATH)
+
+@everywhere const CONFIG_DATA = NBPMscape.load_config(CONFIG_ABS_PATH)
+
+# Map a YAML config Dict onto a parameter NamedTuple by overwriting only the
+# scalar/vector keys that already exist in `P`. Mirrors the conversions done
+# in `NBPMscape.update_configurable_parameters` (rho_hosp -> ρ_hosp etc.) but
+# avoids the requirement of supplying `default_configurable_params` and skips
+# the dataframe-loading step (which expects ICU site files we do not have).
+@everywhere function apply_yaml_scalars(P::NamedTuple, config::Dict)
+    haskey(config, "parameters") || return P
+    params = config["parameters"]
+    P_dict = Dict{Symbol, Any}(pairs(P))
+    name_map = Dict(
+        "rho_hosp"         => :ρ_hosp,
+        "rho_asymptomatic" => :ρ_asymptomatic,
+        "mu"               => :μ,
+        "omega"            => :ω,
+    )
+    for (key, value) in params
+        sym = get(name_map, key, Symbol(key))
+        if haskey(P_dict, sym)
+            # `dowcont` is stored as a Tuple inside P but YAML loads it as Vector
+            if sym === :dowcont
+                value = tuple(value...)
+            end
+            P_dict[sym] = value
+        end
+    end
+    return NamedTuple(P_dict)
+end
+
+# Parameters with config-file overrides applied.
+@everywhere const P_FROM_CONFIG = let
+    p = apply_yaml_scalars(NBPMscape.P, CONFIG_DATA)
+    # Rebuild the ED ARI destination DataFrames from the (possibly updated)
+    # scalar proportions so `secondary_care_td` picks up any changes made in
+    # the YAML config (the scalars are `ed_ari_destinations_adult_p_*`).
+    ed_adult = DataFrame(
+        destination               = [:discharged, :short_stay, :longer_stay],
+        proportion_of_attendances = [p.ed_ari_destinations_adult_p_discharged,
+                                     p.ed_ari_destinations_adult_p_short_stay,
+                                     p.ed_ari_destinations_adult_p_longer_stay],
+    )
+    ed_child = DataFrame(
+        destination               = [:discharged, :short_stay, :longer_stay],
+        proportion_of_attendances = [p.ed_ari_destinations_child_p_discharged,
+                                     p.ed_ari_destinations_child_p_short_stay,
+                                     p.ed_ari_destinations_child_p_longer_stay],
+    )
+    merge(p, (ed_ari_destinations_adult = ed_adult,
+              ed_ari_destinations_child = ed_child))
+end
+
+# Load the HARISS NHS Trust sampling sites file pointed to by the YAML. If the
+# file is absent, fall back to whatever `NBPMscape.P` ships with (dummy data
+# in the current package). Resolved relative to the package root so the path
+# works from any CWD on every worker.
+@everywhere const HARISS_SITES_FROM_CONFIG = let
+    rel = get(get(CONFIG_DATA, "parameters", Dict()),
+              "hariss_nhs_trust_sampling_sites_file", nothing)
+    if rel === nothing
+        NBPMscape.P.hariss_nhs_trust_sampling_sites
+    else
+        full = joinpath(pkgdir(NBPMscape), rel)
+        isfile(full) ? CSV.read(full, DataFrame) : NBPMscape.P.hariss_nhs_trust_sampling_sites
+    end
+end
+
+if myid() == 1
+    println("Loaded HARISS config from: ", CONFIG_ABS_PATH)
+    println("HARISS sites loaded: ", nrow(HARISS_SITES_FROM_CONFIG), " rows")
+    if nrow(HARISS_SITES_FROM_CONFIG) > 0 &&
+       startswith(string(first(HARISS_SITES_FROM_CONFIG[!, 1])), "DM")
+        println("⚠️  HARISS sites file appears to still contain DUMMY trust codes.")
+        println("    Replace data/hariss_nhs_trust_sampling_sites.csv with the real list",
+                " for accurate geographic matching.")
+    end
+end
 
 # ============================================================================
 # SAMPLING FUNCTIONS (must be @everywhere for workers)
@@ -101,7 +204,7 @@ end
     max_observation_time::Float64;
     mean_infectious_period = 8/3,
     turnaround_time::Float64 = 3.0,
-    n_hosp_samples_per_week::Int = NBPMscape.P.n_hosp_samples_per_week,
+    n_hosp_samples_per_week::Int = Int(P_FROM_CONFIG.n_hosp_samples_per_week),
     verbose::Bool = true
 )
     """
@@ -143,10 +246,13 @@ end
     infectious_scale = infectious_period / fixed_shape
     
     # --- SCALE INFECTIVITY ---
+    # Use the YAML-loaded baseline parameters (P_FROM_CONFIG) so all rate /
+    # severity / sampling settings reflect the active config, not the
+    # package-bundled defaults in NBPMscape.P.
     baseline_R0 = 2.03
-    infectivity_scaling = (R0 / baseline_R0) * NBPMscape.P.infectivity
-    
-    base_params = merge(NBPMscape.P, (
+    infectivity_scaling = (R0 / baseline_R0) * P_FROM_CONFIG.infectivity
+
+    base_params = merge(P_FROM_CONFIG, (
         infectivity = infectivity_scaling,
         latent_scale = latent_scale,
         infectious_scale = infectious_scale,
@@ -155,7 +261,7 @@ end
         importrate = 0.0,
         turnaroundtime = turnaround_time
     ))
-    
+
     icu_params = merge(base_params, (psampled = icu_sampling_proportion,))
     
     # Storage for results
@@ -340,11 +446,41 @@ end
                     # secondary_care_td expects sims to be a Vector of infection DataFrames
                     # (it indexes `fo = sims[s]` then `fo.ted`, `fo.thospital`, etc. directly).
                     # It also emits a per-replicate `println` we suppress to keep output clean.
+                    #
+                    # NOTE: secondary_care_td has many keyword arguments that default to
+                    # `NBPMscape.P.*` rather than reading from the `p` arg. To make the
+                    # YAML config actually take effect we pass every HARISS-relevant kwarg
+                    # explicitly from P_FROM_CONFIG / HARISS_SITES_FROM_CONFIG. The
+                    # turnaround time vector is forced to [turnaround_time, turnaround_time]
+                    # so HARISS, ICU, and AWW all use the same fixed turnaround set by
+                    # the script-level `turnaround_time` argument.
                     hariss_result = redirect_stdout(devnull) do
                         NBPMscape.secondary_care_td(;
                             p = base_params,
                             sims = [sims_for_hariss],
-                            n_hosp_samples_per_week = n_hosp_samples_per_week,
+                            pathogen_type                    = P_FROM_CONFIG.pathogen_type,
+                            initial_dow                      = P_FROM_CONFIG.initial_dow,
+                            hariss_courier_to_analysis       = P_FROM_CONFIG.hariss_courier_to_analysis,
+                            hariss_turnaround_time           = [turnaround_time, turnaround_time],
+                            n_hosp_samples_per_week          = n_hosp_samples_per_week,
+                            sample_allocation                = P_FROM_CONFIG.sample_allocation,
+                            sample_proportion_adult          = P_FROM_CONFIG.sample_proportion_adult,
+                            hariss_nhs_trust_sampling_sites  = HARISS_SITES_FROM_CONFIG,
+                            weight_samples_by                = P_FROM_CONFIG.weight_samples_by,
+                            phl_collection_dow               = Vector{Int64}(P_FROM_CONFIG.phl_collection_dow),
+                            phl_collection_time              = Float64(P_FROM_CONFIG.phl_collection_time),
+                            hosp_to_phl_cutoff_time_relative = P_FROM_CONFIG.hosp_to_phl_cutoff_time_relative,
+                            swab_time_mode                   = P_FROM_CONFIG.swab_time_mode,
+                            swab_proportion_at_48h           = P_FROM_CONFIG.swab_proportion_at_48h,
+                            proportion_hosp_swabbed          = P_FROM_CONFIG.proportion_hosp_swabbed,
+                            only_sample_before_death         = P_FROM_CONFIG.hariss_only_sample_before_death,
+                            ed_discharge_limit               = Float64(P_FROM_CONFIG.tdischarge_ed_upper_limit),
+                            hosp_short_stay_limit            = Float64(P_FROM_CONFIG.tdischarge_hosp_short_stay_upper_limit),
+                            hosp_ari_admissions              = Int(P_FROM_CONFIG.hosp_ari_admissions),
+                            hosp_ari_admissions_adult_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
+                            hosp_ari_admissions_child_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
+                            ed_ari_destinations_adult        = P_FROM_CONFIG.ed_ari_destinations_adult,
+                            ed_ari_destinations_child        = P_FROM_CONFIG.ed_ari_destinations_child,
                         )
                     end
 
@@ -511,7 +647,7 @@ function run_simulations_from_merged_csv(
     max_detection_time_threshold::Float64 = 120.0,
     extra_time::Float64 = 20.0,
     icu_sampling_proportion::Float64 = 0.10,
-    n_hosp_samples_per_week::Int = NBPMscape.P.n_hosp_samples_per_week,
+    n_hosp_samples_per_week::Int = Int(P_FROM_CONFIG.n_hosp_samples_per_week),
     output_path::String = "results_aww_icu_hariss.csv",
     batch_size::Int = 125
 )
@@ -526,8 +662,10 @@ function run_simulations_from_merged_csv(
     This gives 8 AWW configurations.
 
     HARISS detection:
-    - Single configuration using n_hosp_samples_per_week (default from
-      NBPMscape.P), all other HARISS parameters from NBPMscape.P.
+    - All HARISS parameters (sample allocation, PHL collection days, hospital
+      ARI background, sampling sites, etc.) are loaded from the YAML config
+      pointed at by `CONFIG_REL_PATH` at the top of this file.
+    - n_hosp_samples_per_week defaults to the value in that config.
 
     Features:
     - Early stopping: Stops each sample when all three channels have detected
@@ -545,6 +683,10 @@ function run_simulations_from_merged_csv(
     println("Samples per combination: $num_samples")
     println("ICU sampling proportion: $(icu_sampling_proportion*100)%")
     println("HARISS samples per week: $n_hosp_samples_per_week")
+    println("HARISS config: $CONFIG_REL_PATH")
+    println("HARISS sample allocation: $(P_FROM_CONFIG.sample_allocation)")
+    println("HARISS PHL collection DOW: $(P_FROM_CONFIG.phl_collection_dow)")
+    println("HARISS hosp ARI background/wk: $(P_FROM_CONFIG.hosp_ari_admissions)")
     println("AWW base p_det values: 8%, 16%")
     println("AWW sampling fractions: 10%, 25%, 50%, 100%")
     println("Workers: $(nworkers())")
@@ -1164,7 +1306,7 @@ results = run_simulations_from_merged_csv(
     max_detection_time_threshold = 200.0,
     extra_time = 35.0,
     icu_sampling_proportion = 0.10,
-    n_hosp_samples_per_week = NBPMscape.P.n_hosp_samples_per_week,
+    n_hosp_samples_per_week = Int(P_FROM_CONFIG.n_hosp_samples_per_week),
     output_path = output_csv_path,
     batch_size = 125
 )
