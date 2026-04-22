@@ -340,7 +340,8 @@ end
         first_icu_detection_time = Inf
         hariss_detected_this_sample = false
         first_hariss_detection_time = Inf
-        last_hariss_check_time = -Inf  # so the first HARISS check fires on day 0
+        # HARISS is now a single end-of-sample check (see block after the
+        # per-day loop), so no weekly-throttle bookkeeping is needed.
 
         # ── HARISS background-ARI cache (fix 1: one realisation per sample) ──
         # Previously `secondary_care_td` re-rolled the full background-ARI
@@ -478,95 +479,84 @@ end
                 end
             end
 
-            # Check HARISS (secondary care) detection after processing this day's imports.
-            # Throttled to once per week per sample -- secondary_care_td simulates a full
-            # background-ARI hospital caseload for every call, so running it every day is
-            # prohibitively expensive and adds little granularity.
-            hariss_due = (time - last_hariss_check_time) >= 7.0 || time >= max_observation_time - 1.0
-            if !hariss_detected_this_sample && !isempty(sample_infections) && hariss_due
-                last_hariss_check_time = time
-                try
-                    sims_for_hariss = sample_infections
-                    if !(:simid in propertynames(sims_for_hariss))
-                        sims_for_hariss = copy(sample_infections)
-                        sims_for_hariss.simid .= "sim-$(sample)"
-                    end
+            # HARISS is NOT checked inside the per-day loop -- see the single
+            # terminal call after this loop. HARISS detection cannot influence
+            # transmission, and running it weekly means re-processing the
+            # whole trajectory each call (the dominant cost per sample). A
+            # single end-of-sample call gives min(treport), which is
+            # mathematically identical to the first weekly check that would
+            # have fired (each weekly snapshot is a prefix of the final
+            # trajectory, so its min(treport) >= final min(treport)).
 
-                    # secondary_care_td expects sims to be a Vector of infection DataFrames
-                    # (it indexes `fo = sims[s]` then `fo.ted`, `fo.thospital`, etc. directly).
-                    # It also emits a per-replicate `println` we suppress to keep output clean.
-                    #
-                    # NOTE: secondary_care_td has many keyword arguments that default to
-                    # `NBPMscape.P.*` rather than reading from the `p` arg. To make the
-                    # YAML config actually take effect we pass every HARISS-relevant kwarg
-                    # explicitly from P_FROM_CONFIG / HARISS_SITES_FROM_CONFIG. The
-                    # turnaround time vector is forced to [turnaround_time, turnaround_time]
-                    # so HARISS, ICU, and AWW all use the same fixed turnaround set by
-                    # the script-level `turnaround_time` argument.
-                    hariss_result = redirect_stdout(devnull) do
-                        NBPMscape.secondary_care_td(;
-                            p = base_params,
-                            sims = [sims_for_hariss],
-                            pathogen_type                    = P_FROM_CONFIG.pathogen_type,
-                            initial_dow                      = P_FROM_CONFIG.initial_dow,
-                            hariss_courier_to_analysis       = P_FROM_CONFIG.hariss_courier_to_analysis,
-                            hariss_turnaround_time           = [turnaround_time, turnaround_time + 1e-6],
-                            n_hosp_samples_per_week          = n_hosp_samples_per_week,
-                            sample_allocation                = P_FROM_CONFIG.sample_allocation,
-                            sample_proportion_adult          = P_FROM_CONFIG.sample_proportion_adult,
-                            hariss_nhs_trust_sampling_sites  = HARISS_SITES_FROM_CONFIG,
-                            weight_samples_by                = P_FROM_CONFIG.weight_samples_by,
-                            phl_collection_dow               = Vector{Int64}(P_FROM_CONFIG.phl_collection_dow),
-                            phl_collection_time              = Float64(P_FROM_CONFIG.phl_collection_time),
-                            hosp_to_phl_cutoff_time_relative = P_FROM_CONFIG.hosp_to_phl_cutoff_time_relative,
-                            swab_time_mode                   = P_FROM_CONFIG.swab_time_mode,
-                            swab_proportion_at_48h           = P_FROM_CONFIG.swab_proportion_at_48h,
-                            proportion_hosp_swabbed          = P_FROM_CONFIG.proportion_hosp_swabbed,
-                            only_sample_before_death         = P_FROM_CONFIG.hariss_only_sample_before_death,
-                            ed_discharge_limit               = Float64(P_FROM_CONFIG.tdischarge_ed_upper_limit),
-                            hosp_short_stay_limit            = Float64(P_FROM_CONFIG.tdischarge_hosp_short_stay_upper_limit),
-                            hosp_ari_admissions              = Int(P_FROM_CONFIG.hosp_ari_admissions),
-                            hosp_ari_admissions_adult_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
-                            hosp_ari_admissions_child_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
-                            ed_ari_destinations_adult        = P_FROM_CONFIG.ed_ari_destinations_adult,
-                            ed_ari_destinations_child        = P_FROM_CONFIG.ed_ari_destinations_child,
-                            # Fix 1: reuse the per-sample cached background ARI realisation
-                            precomputed_ari_bg               = hariss_bg_cache,
-                        )
-                    end
-
-                    if nrow(hariss_result) > 0 && :SC_TD in propertynames(hariss_result)
-                        sc_td_finite = filter(x -> !ismissing(x) && isfinite(x), hariss_result.SC_TD)
-                        if !isempty(sc_td_finite)
-                            td_min = minimum(sc_td_finite)
-                            if td_min <= max_observation_time
-                                hariss_detected_this_sample = true
-                                first_hariss_detection_time = td_min
-                            end
-                        end
-                    end
-                catch hariss_err
-                    # Report errors to stderr so they are not silently swallowed.
-                    @warn "HARISS sampling failed" country=country_name sample=sample day=time err=hariss_err
-                end
-            end
-
-            # EARLY STOPPING — requires *all* simulated channels on this sample:
-            #   ICU + every AWW arm in `airport_detection_probs` (8 values in the
-            #   batched driver below) + HARISS. So HARISS detecting first does not
-            #   end the day loop: imports and `simtree` still run, and weekly
-            #   `secondary_care_td` may still run, until ICU and every p_det and
-            #   HARISS have all fired. Compare `ICU_vs_WW_full_natural_history.jl`,
-            #   which only waited on ICU + WW (and not eight parallel AWW configs).
-            # HARISS is not “free” of the tree: each call passes the growing
-            # `sample_infections` DataFrame into `secondary_care_td`, so cost
-            # scales with outbreak size as well as calendar length.
+            # EARLY STOPPING — ICU + every AWW arm. HARISS is resolved after
+            # the loop, so it no longer gates early exit here. The per-day
+            # loop is cheap (Poisson import draws + bounded simtree calls),
+            # so running until ICU + AWW have fired is dominated by the
+            # simtree cost we were already paying.
             all_airport_detected = all(airport_detected[p] for p in airport_detection_probs)
-            if icu_detected_this_sample && all_airport_detected && hariss_detected_this_sample
+            if icu_detected_this_sample && all_airport_detected
                 if verbose && sample <= 3
-                    println("    Early stop at day $time: All detections occurred")
+                    println("    Early stop at day $time: ICU + all AWW detected")
                 end
                 break
+            end
+        end
+
+        # ── Single end-of-sample HARISS check ──
+        # Equivalent to weekly checks for detection-time purposes. Weekly
+        # version re-drew HARISS randomness each call; here we draw once per
+        # case, matching how ICU / AWW are treated.
+        if !hariss_detected_this_sample && !isempty(sample_infections)
+            try
+                sims_for_hariss = sample_infections
+                if !(:simid in propertynames(sims_for_hariss))
+                    sims_for_hariss = copy(sample_infections)
+                    sims_for_hariss.simid .= "sim-$(sample)"
+                end
+
+                hariss_result = redirect_stdout(devnull) do
+                    NBPMscape.secondary_care_td(;
+                        p = base_params,
+                        sims = [sims_for_hariss],
+                        pathogen_type                    = P_FROM_CONFIG.pathogen_type,
+                        initial_dow                      = P_FROM_CONFIG.initial_dow,
+                        hariss_courier_to_analysis       = P_FROM_CONFIG.hariss_courier_to_analysis,
+                        hariss_turnaround_time           = [turnaround_time, turnaround_time + 1e-6],
+                        n_hosp_samples_per_week          = n_hosp_samples_per_week,
+                        sample_allocation                = P_FROM_CONFIG.sample_allocation,
+                        sample_proportion_adult          = P_FROM_CONFIG.sample_proportion_adult,
+                        hariss_nhs_trust_sampling_sites  = HARISS_SITES_FROM_CONFIG,
+                        weight_samples_by                = P_FROM_CONFIG.weight_samples_by,
+                        phl_collection_dow               = Vector{Int64}(P_FROM_CONFIG.phl_collection_dow),
+                        phl_collection_time              = Float64(P_FROM_CONFIG.phl_collection_time),
+                        hosp_to_phl_cutoff_time_relative = P_FROM_CONFIG.hosp_to_phl_cutoff_time_relative,
+                        swab_time_mode                   = P_FROM_CONFIG.swab_time_mode,
+                        swab_proportion_at_48h           = P_FROM_CONFIG.swab_proportion_at_48h,
+                        proportion_hosp_swabbed          = P_FROM_CONFIG.proportion_hosp_swabbed,
+                        only_sample_before_death         = P_FROM_CONFIG.hariss_only_sample_before_death,
+                        ed_discharge_limit               = Float64(P_FROM_CONFIG.tdischarge_ed_upper_limit),
+                        hosp_short_stay_limit            = Float64(P_FROM_CONFIG.tdischarge_hosp_short_stay_upper_limit),
+                        hosp_ari_admissions              = Int(P_FROM_CONFIG.hosp_ari_admissions),
+                        hosp_ari_admissions_adult_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
+                        hosp_ari_admissions_child_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
+                        ed_ari_destinations_adult        = P_FROM_CONFIG.ed_ari_destinations_adult,
+                        ed_ari_destinations_child        = P_FROM_CONFIG.ed_ari_destinations_child,
+                        precomputed_ari_bg               = hariss_bg_cache,
+                    )
+                end
+
+                if nrow(hariss_result) > 0 && :SC_TD in propertynames(hariss_result)
+                    sc_td_finite = filter(x -> !ismissing(x) && isfinite(x), hariss_result.SC_TD)
+                    if !isempty(sc_td_finite)
+                        td_min = minimum(sc_td_finite)
+                        if td_min <= max_observation_time
+                            hariss_detected_this_sample = true
+                            first_hariss_detection_time = td_min
+                        end
+                    end
+                end
+            catch hariss_err
+                @warn "HARISS sampling failed" country=country_name sample=sample err=hariss_err
             end
         end
         
