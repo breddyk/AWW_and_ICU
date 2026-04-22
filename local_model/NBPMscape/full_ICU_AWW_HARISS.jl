@@ -19,29 +19,38 @@
 # the `config/HARISS/covid19_like_params_HARISS_*.yaml` scenarios by
 # changing `CONFIG_REL_PATH` below.
 #
-# Note: the underlying `data/hariss_nhs_trust_sampling_sites.csv` may still
-# contain dummy `DM*` codes -- replace with the real NHS Trust list to get
-# realistic geographic matching against `homeregion`.
+# NHS Trust / geography data (HARISS)
+# -----------------------------------
+# The HARISS hospital network is `data/hariss_nhs_trust_sampling_sites.csv`
+# (YAML key `hariss_nhs_trust_sampling_sites_file`). NBPMscape supplies
+# supporting lookup tables (`AE_12M`, catchment populations, ITL2→trust
+# admission probabilities) from `data/nhs_trust_data/*.csv`. After replacing
+# the upstream NHS source files, regenerate the derived CSVs with:
+#     python3 scripts/build_hariss_nhs_trust_lookups.py
 # ============================================================================
 
+# Activate the NBPMscape project environment on the MAIN process BEFORE
+# loading NBPMscape (it's a local, unregistered package, so it won't be
+# findable otherwise). Workers are activated below after addprocs.
+using Pkg
+const _PROJECT_DIR = normpath(joinpath(@__DIR__, ".."))
+Pkg.activate(_PROJECT_DIR)
+# If this is the first run in a fresh checkout (or deps changed), uncomment:
+# Pkg.instantiate()
+
 using NBPMscape
-using Plots
+# using Plots
 using DataFrames
 using Statistics
 using Distributions
 using CSV
-using StatsPlots
-using LaTeXStrings
-using KernelDensity
+# using StatsPlots
+# using LaTeXStrings
+# using KernelDensity
 using Distributed
 using Dates
 
-# Compute the absolute path to the project root (where Project.toml lives)
-# BEFORE spawning workers so it resolves on the main process. Workers receive
-# the string value, not the @__DIR__ expression.
-const _PROJECT_DIR = normpath(joinpath(@__DIR__, ".."))
-
-addprocs(1)
+addprocs(180)
 
 @everywhere using Pkg
 @everywhere Pkg.activate($_PROJECT_DIR)
@@ -53,7 +62,7 @@ addprocs(1)
 @everywhere using Distributions
 @everywhere using CSV
 
-default(fontfamily="Times New Roman")
+# default(fontfamily="Times New Roman")
 
 # ============================================================================
 # REAL CONFIG LOADING (must run on every worker so HARISS uses the same
@@ -128,8 +137,8 @@ end
 end
 
 # Load the HARISS NHS Trust sampling sites file pointed to by the YAML. If the
-# file is absent, fall back to whatever `NBPMscape.P` ships with (dummy data
-# in the current package). Resolved relative to the package root so the path
+# file is absent, fall back to `NBPMscape.P.hariss_nhs_trust_sampling_sites`
+# (the package-bundled default). Resolved relative to the package root so the path
 # works from any CWD on every worker.
 @everywhere const HARISS_SITES_FROM_CONFIG = let
     rel = get(get(CONFIG_DATA, "parameters", Dict()),
@@ -256,7 +265,7 @@ end
     fixed_shape = 1000.0
     latent_scale = latent_period / fixed_shape
     infectious_scale = infectious_period / fixed_shape
-    
+
     # --- SCALE INFECTIVITY ---
     # Use the YAML-loaded baseline parameters (P_FROM_CONFIG) so all rate /
     # severity / sampling settings reflect the active config, not the
@@ -332,6 +341,34 @@ end
         hariss_detected_this_sample = false
         first_hariss_detection_time = Inf
         last_hariss_check_time = -Inf  # so the first HARISS check fires on day 0
+
+        # ── HARISS background-ARI cache (fix 1: one realisation per sample) ──
+        # Previously `secondary_care_td` re-rolled the full background-ARI
+        # hospital population on every weekly HARISS call within this sample,
+        # treating each check as an independent draw. That biased detections
+        # earlier (many lotteries) and inflated variance. We now build a single
+        # cached realisation covering the full observation window and pass it
+        # to every HARISS call in this sample, so the background world stays
+        # consistent across checks -- matching physical reality. ICU / AWW
+        # are unaffected.
+        hariss_bg_cache = NBPMscape.build_ari_background(;
+            max_observation_time            = Float64(max_observation_time),
+            n_hosp_samples_per_week         = n_hosp_samples_per_week,
+            sample_allocation               = P_FROM_CONFIG.sample_allocation,
+            sample_proportion_adult         = P_FROM_CONFIG.sample_proportion_adult,
+            hariss_nhs_trust_sampling_sites = HARISS_SITES_FROM_CONFIG,
+            weight_samples_by               = P_FROM_CONFIG.weight_samples_by,
+            swab_time_mode                  = P_FROM_CONFIG.swab_time_mode,
+            swab_proportion_at_48h          = P_FROM_CONFIG.swab_proportion_at_48h,
+            proportion_hosp_swabbed         = P_FROM_CONFIG.proportion_hosp_swabbed,
+            ed_discharge_limit              = Float64(P_FROM_CONFIG.tdischarge_ed_upper_limit),
+            hosp_short_stay_limit           = Float64(P_FROM_CONFIG.tdischarge_hosp_short_stay_upper_limit),
+            hosp_ari_admissions             = Int(P_FROM_CONFIG.hosp_ari_admissions),
+            hosp_ari_admissions_adult_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
+            hosp_ari_admissions_child_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
+            ed_ari_destinations_adult       = P_FROM_CONFIG.ed_ari_destinations_adult,
+            ed_ari_destinations_child       = P_FROM_CONFIG.ed_ari_destinations_child,
+        )
         
         # Track WW detection for each p_det
         airport_detected = Dict{Float64, Bool}()
@@ -473,7 +510,7 @@ end
                             pathogen_type                    = P_FROM_CONFIG.pathogen_type,
                             initial_dow                      = P_FROM_CONFIG.initial_dow,
                             hariss_courier_to_analysis       = P_FROM_CONFIG.hariss_courier_to_analysis,
-                            hariss_turnaround_time           = [turnaround_time, turnaround_time],
+                            hariss_turnaround_time           = [turnaround_time, turnaround_time + 1e-6],
                             n_hosp_samples_per_week          = n_hosp_samples_per_week,
                             sample_allocation                = P_FROM_CONFIG.sample_allocation,
                             sample_proportion_adult          = P_FROM_CONFIG.sample_proportion_adult,
@@ -493,6 +530,8 @@ end
                             hosp_ari_admissions_child_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
                             ed_ari_destinations_adult        = P_FROM_CONFIG.ed_ari_destinations_adult,
                             ed_ari_destinations_child        = P_FROM_CONFIG.ed_ari_destinations_child,
+                            # Fix 1: reuse the per-sample cached background ARI realisation
+                            precomputed_ari_bg               = hariss_bg_cache,
                         )
                     end
 
@@ -512,7 +551,16 @@ end
                 end
             end
 
-            # EARLY STOPPING
+            # EARLY STOPPING — requires *all* simulated channels on this sample:
+            #   ICU + every AWW arm in `airport_detection_probs` (8 values in the
+            #   batched driver below) + HARISS. So HARISS detecting first does not
+            #   end the day loop: imports and `simtree` still run, and weekly
+            #   `secondary_care_td` may still run, until ICU and every p_det and
+            #   HARISS have all fired. Compare `ICU_vs_WW_full_natural_history.jl`,
+            #   which only waited on ICU + WW (and not eight parallel AWW configs).
+            # HARISS is not “free” of the tree: each call passes the growing
+            # `sample_infections` DataFrame into `secondary_care_td`, so cost
+            # scales with outbreak size as well as calendar length.
             all_airport_detected = all(airport_detected[p] for p in airport_detection_probs)
             if icu_detected_this_sample && all_airport_detected && hariss_detected_this_sample
                 if verbose && sample <= 3
@@ -737,11 +785,24 @@ function run_simulations_from_merged_csv(
         param_combinations
     )
 
-    # # Filter out R0 = 3, gen_time = 4.0
-    # valid_combinations = filter(row -> 
-    #     !(Float64(row.R0) == 3.0 && Float64(row.generation_time) == 4.0),
+    # # # Restrict to a specific whitelist of countries
+    # allowed_countries = Set(["Paraguay", "Ghana", "Switzerland"])
+    # valid_combinations = filter(row ->
+    #     row.outbreak_country ∈ allowed_countries,
     #     valid_combinations
     # )
+
+    # # # Remove R0 = 3.0, gen time = 4.0
+    # valid_combinations = filter(row -> 
+    #     !(Float64(row.R0) == 3.0) && !(Float64(row.generation_time) == 4.0),
+    #     valid_combinations
+    # )
+
+    # Filter to R0 = 2.0, gen time = 6.0
+    valid_combinations = filter(row -> 
+        (Float64(row.R0) == 2.0) && (Float64(row.generation_time) == 6.0),
+        valid_combinations
+    )
 
     println("After filtering: $(nrow(valid_combinations)) valid combinations")
     println("(Excluded $(nrow(param_combinations) - nrow(valid_combinations)) with mean_detection_time > $max_detection_time_threshold or missing)")
