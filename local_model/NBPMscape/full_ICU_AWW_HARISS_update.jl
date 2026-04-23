@@ -237,7 +237,8 @@ end
     mean_generation_time::Float64,
     icu_sampling_proportion::Float64,
     airport_detection_probs::Vector{Float64},
-    max_observation_time::Float64;
+    max_observation_time::Float64,
+    hariss_bg_cache;
     mean_infectious_period = 8/3,
     turnaround_time::Float64 = 3.0,
     n_hosp_samples_per_week::Int = Int(P_FROM_CONFIG.n_hosp_samples_per_week)
@@ -410,30 +411,10 @@ end
     end
 
     # ── Single end-of-sample HARISS check ──
-    # HARISS requires local (generation > 0) UK cases to route through the
-    # NHS trust → swab → courier → PHL pathway.  Skipping when n_local == 0
-    # avoids the expensive build_ari_background call on samples where the
-    # pathogen never spreads beyond imported cases.
+    # HARISS requires local (generation > 0) UK cases; skip when there are
+    # none (legitimate Inf). hariss_bg_cache is passed in pre-built.
     n_local = isempty(sample_infections) ? 0 : sum(sample_infections.generation .> 0)
-    if n_local > 0
-        hariss_bg_cache = NBPMscape.build_ari_background(;
-            max_observation_time             = Float64(max_observation_time),
-            initial_dow                      = P_FROM_CONFIG.initial_dow,
-            n_hosp_samples_per_week          = n_hosp_samples_per_week,
-            sample_allocation                = P_FROM_CONFIG.sample_allocation,
-            sample_proportion_adult          = P_FROM_CONFIG.sample_proportion_adult,
-            hariss_nhs_trust_sampling_sites  = HARISS_SITES_FROM_CONFIG,
-            weight_samples_by                = P_FROM_CONFIG.weight_samples_by,
-            phl_collection_dow               = Vector{Int64}(P_FROM_CONFIG.phl_collection_dow),
-            phl_collection_time              = Float64(P_FROM_CONFIG.phl_collection_time),
-            hosp_to_phl_cutoff_time_relative = P_FROM_CONFIG.hosp_to_phl_cutoff_time_relative,
-            hosp_ari_admissions              = Int(P_FROM_CONFIG.hosp_ari_admissions),
-            hosp_ari_admissions_adult_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
-            hosp_ari_admissions_child_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
-            ed_ari_destinations_adult        = P_FROM_CONFIG.ed_ari_destinations_adult,
-            ed_ari_destinations_child        = P_FROM_CONFIG.ed_ari_destinations_child,
-        )
-
+    if n_local > 0 && hariss_bg_cache !== nothing
         try
             sims_for_hariss = sample_infections
             if !(:simid in propertynames(sims_for_hariss))
@@ -615,6 +596,24 @@ end
         println("    HARISS samples/week: $(n_hosp_samples_per_week)")
     end
 
+    hariss_bg_cache = NBPMscape.build_ari_background(;
+        max_observation_time             = Float64(max_observation_time),
+        initial_dow                      = P_FROM_CONFIG.initial_dow,
+        n_hosp_samples_per_week          = n_hosp_samples_per_week,
+        sample_allocation                = P_FROM_CONFIG.sample_allocation,
+        sample_proportion_adult          = P_FROM_CONFIG.sample_proportion_adult,
+        hariss_nhs_trust_sampling_sites  = HARISS_SITES_FROM_CONFIG,
+        weight_samples_by                = P_FROM_CONFIG.weight_samples_by,
+        phl_collection_dow               = Vector{Int64}(P_FROM_CONFIG.phl_collection_dow),
+        phl_collection_time              = Float64(P_FROM_CONFIG.phl_collection_time),
+        hosp_to_phl_cutoff_time_relative = P_FROM_CONFIG.hosp_to_phl_cutoff_time_relative,
+        hosp_ari_admissions              = Int(P_FROM_CONFIG.hosp_ari_admissions),
+        hosp_ari_admissions_adult_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
+        hosp_ari_admissions_child_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
+        ed_ari_destinations_adult        = P_FROM_CONFIG.ed_ari_destinations_adult,
+        ed_ari_destinations_child        = P_FROM_CONFIG.ed_ari_destinations_child,
+    )
+
     sample_results = Vector{Any}(undef, num_samples)
     for sample in 1:num_samples
         if verbose && (sample % 10 == 0 || sample == 1)
@@ -624,7 +623,8 @@ end
         sample_results[sample] = simulate_single_sample(
             country_data, country_name, sample,
             R0, mean_generation_time, icu_sampling_proportion,
-            airport_detection_probs, max_observation_time;
+            airport_detection_probs, max_observation_time,
+            hariss_bg_cache;
             mean_infectious_period = mean_infectious_period,
             turnaround_time = turnaround_time,
             n_hosp_samples_per_week = n_hosp_samples_per_week
@@ -1229,14 +1229,33 @@ function run_simulations_from_merged_csv(
                 continue
             end
 
+            combo_bg_cache = NBPMscape.build_ari_background(;
+                max_observation_time             = Float64(max_obs_time),
+                initial_dow                      = P_FROM_CONFIG.initial_dow,
+                n_hosp_samples_per_week          = n_hosp_samples_per_week,
+                sample_allocation                = P_FROM_CONFIG.sample_allocation,
+                sample_proportion_adult          = P_FROM_CONFIG.sample_proportion_adult,
+                hariss_nhs_trust_sampling_sites  = HARISS_SITES_FROM_CONFIG,
+                weight_samples_by                = P_FROM_CONFIG.weight_samples_by,
+                phl_collection_dow               = Vector{Int64}(P_FROM_CONFIG.phl_collection_dow),
+                phl_collection_time              = Float64(P_FROM_CONFIG.phl_collection_time),
+                hosp_to_phl_cutoff_time_relative = P_FROM_CONFIG.hosp_to_phl_cutoff_time_relative,
+                hosp_ari_admissions              = Int(P_FROM_CONFIG.hosp_ari_admissions),
+                hosp_ari_admissions_adult_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
+                hosp_ari_admissions_child_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
+                ed_ari_destinations_adult        = P_FROM_CONFIG.ed_ari_destinations_adult,
+                ed_ari_destinations_child        = P_FROM_CONFIG.ed_ari_destinations_child,
+            )
+
             push!(combo_specs, (
-                global_idx = global_idx,
-                country = country,
-                R0 = R0,
-                gen_time = gen_time,
+                global_idx    = global_idx,
+                country       = country,
+                R0            = R0,
+                gen_time      = gen_time,
                 mean_det_time = mean_det_time,
-                max_obs_time = max_obs_time,
-                country_data = country_trimmed
+                max_obs_time  = max_obs_time,
+                country_data  = country_trimmed,
+                hariss_bg_cache = combo_bg_cache,
             ))
         end
 
@@ -1284,7 +1303,8 @@ function run_simulations_from_merged_csv(
                         spec.gen_time,
                         icu_sampling_proportion,
                         p_dets,
-                        spec.max_obs_time;
+                        spec.max_obs_time,
+                        spec.hariss_bg_cache;
                         turnaround_time = turnaround_time,
                         n_hosp_samples_per_week = n_hosp_samples_per_week
                     )

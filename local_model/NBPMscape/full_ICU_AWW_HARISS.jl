@@ -304,7 +304,28 @@ end
     latent_imports_per_sample = Float64[]
     infectious_imports_per_sample = Float64[]
     detectable_imports_per_sample = Float64[]
-    
+
+    # Build hariss_bg_cache once per combination. All parameters are NHS config
+    # values + max_observation_time — none depend on the outbreak country's
+    # importation data, so the cache is valid for every sample in this loop.
+    hariss_bg_cache = NBPMscape.build_ari_background(;
+        max_observation_time             = Float64(max_observation_time),
+        initial_dow                      = P_FROM_CONFIG.initial_dow,
+        n_hosp_samples_per_week          = n_hosp_samples_per_week,
+        sample_allocation                = P_FROM_CONFIG.sample_allocation,
+        sample_proportion_adult          = P_FROM_CONFIG.sample_proportion_adult,
+        hariss_nhs_trust_sampling_sites  = HARISS_SITES_FROM_CONFIG,
+        weight_samples_by                = P_FROM_CONFIG.weight_samples_by,
+        phl_collection_dow               = Vector{Int64}(P_FROM_CONFIG.phl_collection_dow),
+        phl_collection_time              = Float64(P_FROM_CONFIG.phl_collection_time),
+        hosp_to_phl_cutoff_time_relative = P_FROM_CONFIG.hosp_to_phl_cutoff_time_relative,
+        hosp_ari_admissions              = Int(P_FROM_CONFIG.hosp_ari_admissions),
+        hosp_ari_admissions_adult_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
+        hosp_ari_admissions_child_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
+        ed_ari_destinations_adult        = P_FROM_CONFIG.ed_ari_destinations_adult,
+        ed_ari_destinations_child        = P_FROM_CONFIG.ed_ari_destinations_child,
+    )
+
     for sample in 1:num_samples
         if verbose && (sample % 10 == 0 || sample == 1)
             println("    Sample $sample/$num_samples")
@@ -478,30 +499,10 @@ end
         end
 
         # ── Single end-of-sample HARISS check ──
-        # HARISS requires local (generation > 0) UK cases to route through the
-        # NHS trust → swab → courier → PHL pathway.  Skipping when n_local == 0
-        # avoids the expensive build_ari_background call on samples where the
-        # pathogen never spreads beyond imported cases.
+        # HARISS requires local (generation > 0) UK cases; skip when there are
+        # none (legitimate Inf). hariss_bg_cache was built once before this loop.
         n_local = isempty(sample_infections) ? 0 : sum(sample_infections.generation .> 0)
         if !hariss_detected_this_sample && n_local > 0
-            hariss_bg_cache = NBPMscape.build_ari_background(;
-                max_observation_time             = Float64(max_observation_time),
-                initial_dow                      = P_FROM_CONFIG.initial_dow,
-                n_hosp_samples_per_week          = n_hosp_samples_per_week,
-                sample_allocation                = P_FROM_CONFIG.sample_allocation,
-                sample_proportion_adult          = P_FROM_CONFIG.sample_proportion_adult,
-                hariss_nhs_trust_sampling_sites  = HARISS_SITES_FROM_CONFIG,
-                weight_samples_by                = P_FROM_CONFIG.weight_samples_by,
-                phl_collection_dow               = Vector{Int64}(P_FROM_CONFIG.phl_collection_dow),
-                phl_collection_time              = Float64(P_FROM_CONFIG.phl_collection_time),
-                hosp_to_phl_cutoff_time_relative = P_FROM_CONFIG.hosp_to_phl_cutoff_time_relative,
-                hosp_ari_admissions              = Int(P_FROM_CONFIG.hosp_ari_admissions),
-                hosp_ari_admissions_adult_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
-                hosp_ari_admissions_child_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
-                ed_ari_destinations_adult        = P_FROM_CONFIG.ed_ari_destinations_adult,
-                ed_ari_destinations_child        = P_FROM_CONFIG.ed_ari_destinations_child,
-            )
-
             try
                 sims_for_hariss = sample_infections
                 if !(:simid in propertynames(sims_for_hariss))
