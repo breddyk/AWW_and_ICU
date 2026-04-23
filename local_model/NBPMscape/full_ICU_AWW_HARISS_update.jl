@@ -1200,7 +1200,9 @@ function run_simulations_from_merged_csv(
         # here (instead of inside every pmap task) avoids re-scanning the
         # 900k-row merged table from every worker, every sample.
         # --------------------------------------------------------------
-        combo_specs = NamedTuple[]
+        # Phase 1a: data filtering (sequential, fast — avoids re-scanning
+        # the merged table from workers).
+        combo_specs_no_cache = NamedTuple[]
         for (i, param_row) in enumerate(eachrow(batch_combinations))
             global_idx = batch_start + i - 1
             R0 = Float64(param_row.R0)
@@ -1229,8 +1231,28 @@ function run_simulations_from_merged_csv(
                 continue
             end
 
-            combo_bg_cache = NBPMscape.build_ari_background(;
-                max_observation_time             = Float64(max_obs_time),
+            push!(combo_specs_no_cache, (
+                global_idx    = global_idx,
+                country       = country,
+                R0            = R0,
+                gen_time      = gen_time,
+                mean_det_time = mean_det_time,
+                max_obs_time  = max_obs_time,
+                country_data  = country_trimmed,
+            ))
+        end
+
+        # Phase 1b: build one hariss_bg_cache per combination in parallel.
+        # build_ari_background is independent of importation data — only
+        # max_obs_time varies per combo; all other params are NHS config
+        # constants already resident on every worker. With 180 workers all
+        # 125 builds run simultaneously (~1 round × 7-10s) rather than
+        # sequentially on the main process (125 × 7-10s ≈ 950s).
+        println("  Pre-building $(length(combo_specs_no_cache)) HARISS background caches in parallel...")
+        flush(stdout)
+        hariss_caches = pmap(combo_specs_no_cache) do spec
+            NBPMscape.build_ari_background(;
+                max_observation_time             = Float64(spec.max_obs_time),
                 initial_dow                      = P_FROM_CONFIG.initial_dow,
                 n_hosp_samples_per_week          = n_hosp_samples_per_week,
                 sample_allocation                = P_FROM_CONFIG.sample_allocation,
@@ -1246,18 +1268,10 @@ function run_simulations_from_merged_csv(
                 ed_ari_destinations_adult        = P_FROM_CONFIG.ed_ari_destinations_adult,
                 ed_ari_destinations_child        = P_FROM_CONFIG.ed_ari_destinations_child,
             )
-
-            push!(combo_specs, (
-                global_idx    = global_idx,
-                country       = country,
-                R0            = R0,
-                gen_time      = gen_time,
-                mean_det_time = mean_det_time,
-                max_obs_time  = max_obs_time,
-                country_data  = country_trimmed,
-                hariss_bg_cache = combo_bg_cache,
-            ))
         end
+
+        combo_specs = [(; spec..., hariss_bg_cache = cache)
+                       for (spec, cache) in zip(combo_specs_no_cache, hariss_caches)]
 
         if isempty(combo_specs)
             println("No valid combinations in this batch, skipping.")
