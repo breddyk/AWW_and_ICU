@@ -129,11 +129,10 @@ end
     return daily_imports, total_imports
 end
 
-"""
-One Monte Carlo sample. AWW uses `p_det` on true imports only; `false_positive_rate`
-is Bernoulli on days with no true positive draw. Two consecutive reported
-positives set AWW detection on the second day.
-"""
+# One Monte Carlo sample. AWW uses p_det on true imports only; false_positive_rate
+# is Bernoulli on days with no true positive draw. Two consecutive reported
+# positives set AWW detection on the second day.
+# (Triple-quoted docstrings cannot be attached to @everywhere functions.)
 @everywhere function simulate_multitype_sample(
     country_data::DataFrame,
     country_name::String,
@@ -187,24 +186,8 @@ positives set AWW detection on the second day.
     hariss_detected = false
     first_hariss_time = Inf
 
-    hariss_bg_cache = NBPMscape.build_ari_background(;
-        max_observation_time            = Float64(max_observation_time),
-        n_hosp_samples_per_week         = n_hosp_samples_per_week,
-        sample_allocation               = P_FROM_CONFIG.sample_allocation,
-        sample_proportion_adult         = P_FROM_CONFIG.sample_proportion_adult,
-        hariss_nhs_trust_sampling_sites = HARISS_SITES_FROM_CONFIG,
-        weight_samples_by               = P_FROM_CONFIG.weight_samples_by,
-        swab_time_mode                  = P_FROM_CONFIG.swab_time_mode,
-        swab_proportion_at_48h          = P_FROM_CONFIG.swab_proportion_at_48h,
-        proportion_hosp_swabbed         = P_FROM_CONFIG.proportion_hosp_swabbed,
-        ed_discharge_limit              = Float64(P_FROM_CONFIG.tdischarge_ed_upper_limit),
-        hosp_short_stay_limit           = Float64(P_FROM_CONFIG.tdischarge_hosp_short_stay_upper_limit),
-        hosp_ari_admissions             = Int(P_FROM_CONFIG.hosp_ari_admissions),
-        hosp_ari_admissions_adult_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
-        hosp_ari_admissions_child_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
-        ed_ari_destinations_adult       = P_FROM_CONFIG.ed_ari_destinations_adult,
-        ed_ari_destinations_child       = P_FROM_CONFIG.ed_ari_destinations_child,
-    )
+    # hariss_bg_cache is built after the loop, only when local cases exist,
+    # so we never pay for it on samples with no local spread.
 
     aww_detected = false
     first_aww_time = Inf
@@ -214,6 +197,7 @@ positives set AWW detection on the second day.
         time = row.time
         time >= max_observation_time && break
 
+        # AWW: always evaluate — cheap Bernoulli draws, independent of the tree.
         daily_detectable_count = detectable_import_counts[idx]
         p_true = daily_detectable_count > 0 ? 1.0 - (1.0 - p_det)^daily_detectable_count : 0.0
         true_positive = rand() < p_true
@@ -229,60 +213,89 @@ positives set AWW detection on the second day.
             prev_aww_positive = false
         end
 
-        daily_latent_count = latent_import_counts[idx]
-        daily_infectious_count = infectious_import_counts[idx]
+        # Tree building and ICU: stop once ICU has detected.
+        # This caps sample_infections growth — critical for high R0 where each
+        # simtree call produces a large subtree and sampleforest cost scales with
+        # the total number of accumulated infections.
+        if !icu_detected
+            daily_latent_count = latent_import_counts[idx]
+            daily_infectious_count = infectious_import_counts[idx]
 
-        for j in 1:daily_latent_count
-            results = NBPMscape.simtree(base_params,
-                initialtime = Float64(time) - latent_period / 2.0,
-                maxtime = max_observation_time,
-                maxgenerations = 100,
-                initialcontact = :G,
-            )
-            if nrow(results.G) > 0
-                results.G[1, :generation] = 0
-                results.G.import_event .= Int(time)
-                results.G.import_time .= Float64(time)
-                if isempty(sample_infections)
-                    sample_infections = results.G
-                else
-                    append!(sample_infections, results.G)
+            for j in 1:daily_latent_count
+                results = NBPMscape.simtree(base_params,
+                    initialtime = Float64(time) - latent_period / 2.0,
+                    maxtime = max_observation_time,
+                    maxgenerations = 100,
+                    initialcontact = :G,
+                )
+                if nrow(results.G) > 0
+                    results.G[1, :generation] = 0
+                    results.G.import_event .= Int(time)
+                    results.G.import_time .= Float64(time)
+                    if isempty(sample_infections)
+                        sample_infections = results.G
+                    else
+                        append!(sample_infections, results.G)
+                    end
+                end
+            end
+            for j in 1:daily_infectious_count
+                results = NBPMscape.simtree(infectious_params,
+                    initialtime = Float64(time),
+                    maxtime = max_observation_time,
+                    maxgenerations = 100,
+                    initialcontact = :G,
+                )
+                if nrow(results.G) > 0
+                    results.G[1, :generation] = 0
+                    results.G.import_event .= Int(time)
+                    results.G.import_time .= Float64(time)
+                    if isempty(sample_infections)
+                        sample_infections = results.G
+                    else
+                        append!(sample_infections, results.G)
+                    end
+                end
+            end
+
+            if !isempty(sample_infections)
+                icu_sampled = NBPMscape.sampleforest((G = sample_infections,), icu_params)
+                if !isempty(icu_sampled.treport)
+                    icu_detected = true
+                    first_icu_time = minimum(icu_sampled.treport)
                 end
             end
         end
-        for j in 1:daily_infectious_count
-            results = NBPMscape.simtree(infectious_params,
-                initialtime = Float64(time),
-                maxtime = max_observation_time,
-                maxgenerations = 100,
-                initialcontact = :G,
-            )
-            if nrow(results.G) > 0
-                results.G[1, :generation] = 0
-                results.G.import_event .= Int(time)
-                results.G.import_time .= Float64(time)
-                if isempty(sample_infections)
-                    sample_infections = results.G
-                else
-                    append!(sample_infections, results.G)
-                end
-            end
-        end
 
-        if !icu_detected && !isempty(sample_infections)
-            icu_sampled = NBPMscape.sampleforest((G = sample_infections,), icu_params)
-            if !isempty(icu_sampled.treport)
-                icu_detected = true
-                first_icu_time = minimum(icu_sampled.treport)
-            end
-        end
-
-        if icu_detected && aww_detected
-            break
-        end
+        # Exit once both ICU and AWW have fired. AWW is checked above regardless,
+        # so running the loop past ICU detection while waiting for AWW is cheap.
+        icu_detected && aww_detected && break
     end
 
-    if !isempty(sample_infections)
+    # HARISS: only meaningful when local UK cases exist. Build the ARI background
+    # here (not before the loop) so the cost is only paid when there is something
+    # to detect. Samples with no local spread return Inf legitimately.
+    n_local = isempty(sample_infections) ? 0 : sum(sample_infections.generation .> 0)
+
+    if n_local > 0
+        hariss_bg_cache = NBPMscape.build_ari_background(;
+            max_observation_time            = Float64(max_observation_time),
+            n_hosp_samples_per_week         = n_hosp_samples_per_week,
+            sample_allocation               = P_FROM_CONFIG.sample_allocation,
+            sample_proportion_adult         = P_FROM_CONFIG.sample_proportion_adult,
+            hariss_nhs_trust_sampling_sites = HARISS_SITES_FROM_CONFIG,
+            weight_samples_by               = P_FROM_CONFIG.weight_samples_by,
+            swab_time_mode                  = P_FROM_CONFIG.swab_time_mode,
+            swab_proportion_at_48h          = P_FROM_CONFIG.swab_proportion_at_48h,
+            proportion_hosp_swabbed         = P_FROM_CONFIG.proportion_hosp_swabbed,
+            ed_discharge_limit              = Float64(P_FROM_CONFIG.tdischarge_ed_upper_limit),
+            hosp_short_stay_limit           = Float64(P_FROM_CONFIG.tdischarge_hosp_short_stay_upper_limit),
+            hosp_ari_admissions             = Int(P_FROM_CONFIG.hosp_ari_admissions),
+            hosp_ari_admissions_adult_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
+            hosp_ari_admissions_child_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
+            ed_ari_destinations_adult       = P_FROM_CONFIG.ed_ari_destinations_adult,
+            ed_ari_destinations_child       = P_FROM_CONFIG.ed_ari_destinations_child,
+        )
         try
             sims_for_hariss = sample_infections
             if !(:simid in propertynames(sims_for_hariss))
@@ -412,22 +425,27 @@ function run_multitype_comparison(;
     println("="^80)
 
     merged_data = CSV.read(csv_path, DataFrame)
+    _country_eq(r, c) = string(r.outbreak_country) == string(c)
     param_row = filter(
         r -> Float64(r.R0) == R0 &&
              Float64(r.generation_time) == gen_time &&
-             String(r.outbreak_country) == country,
+             _country_eq(r, country),
         merged_data,
     )
     nrow(param_row) == 0 && error("No rows in CSV for country=$country R0=$R0 gen_time=$gen_time")
-    mean_det_time = Float64(first(param_row).mean_detection_time)
-    (ismissing(mean_det_time) || isnan(mean_det_time) || mean_det_time > max_detection_time_threshold) &&
-        error("Invalid or missing mean_detection_time for scenario")
+    mdts = unique(collect(skipmissing(param_row.mean_detection_time)))
+    isempty(mdts) && error("mean_detection_time is missing for all matching CSV rows")
+    length(mdts) != 1 &&
+        error("Expected a single mean_detection_time for this scenario; got $(length(mdts)) distinct values")
+    mean_det_time = Float64(first(mdts))
+    (isnan(mean_det_time) || mean_det_time > max_detection_time_threshold) &&
+        error("Invalid mean_detection_time=$mean_det_time for scenario")
 
     max_obs_time = mean_det_time + extra_time
     country_data = filter(
         r -> Float64(r.R0) == R0 &&
              Float64(r.generation_time) == gen_time &&
-             String(r.outbreak_country) == country,
+             _country_eq(r, country),
         merged_data,
     )
     sort!(country_data, :time)
