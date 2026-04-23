@@ -27,6 +27,7 @@ using Distributions
 using CSV
 using Distributed
 using Dates
+using Printf
 
 # Increase for production runs (e.g. addprocs(180))
 addprocs(1)
@@ -455,32 +456,55 @@ function run_multitype_comparison(;
     out_dir = dirname(output_path)
     !isempty(out_dir) && !isdir(out_dir) && mkpath(out_dir)
 
-    tasks = collect(1:num_samples)
-    rows = pmap(tasks) do sample_id
-        simulate_multitype_sample(
-            country_trimmed,
-            country,
-            sample_id,
-            R0,
-            gen_time,
-            icu_sampling_proportion,
-            p_det,
-            false_positive_rate,
-            max_obs_time;
-            turnaround_time = turnaround_time,
-            n_hosp_samples_per_week = n_hosp_samples_per_week,
-        )
+    println("\nStarting pmap over $num_samples samples on $(nworkers()) workers...")
+    println("max_observation_time = $(round(max_obs_time, digits=1)) days")
+    flush(stdout)
+
+    batch_size = max(1, min(50, num_samples ÷ nworkers()))
+    all_rows = Vector{Any}()
+    sizehint!(all_rows, num_samples)
+    t_start = time()
+
+    for batch_start in 1:batch_size:num_samples
+        batch_end = min(batch_start + batch_size - 1, num_samples)
+        batch_ids = collect(batch_start:batch_end)
+
+        batch_rows = pmap(batch_ids) do sample_id
+            simulate_multitype_sample(
+                country_trimmed,
+                country,
+                sample_id,
+                R0,
+                gen_time,
+                icu_sampling_proportion,
+                p_det,
+                false_positive_rate,
+                max_obs_time;
+                turnaround_time = turnaround_time,
+                n_hosp_samples_per_week = n_hosp_samples_per_week,
+            )
+        end
+        append!(all_rows, batch_rows)
+
+        elapsed = time() - t_start
+        done = length(all_rows)
+        rate = done / elapsed
+        eta = (num_samples - done) / rate
+        @printf("  [%4d/%4d] %.1fs elapsed | %.2f samples/s | ETA %.1fs\n",
+                done, num_samples, elapsed, rate, eta)
+        flush(stdout)
     end
 
-    df = DataFrame(rows)
+    df = DataFrame(all_rows)
     CSV.write(output_path, df)
-    println("\nWrote $(nrow(df)) rows to $output_path")
+    total = round(time() - t_start, digits=1)
+    println("\nWrote $(nrow(df)) rows to $output_path  (total: $(total)s)")
     return df
 end
 
 
-const SCENARIO_R0 = 1.5
-const SCENARIO_GEN_TIME = 6.0
+const SCENARIO_R0 = 2.0
+const SCENARIO_GEN_TIME = 4.0
 const SCENARIO_BASE_PDET = 0.16
 const SCENARIO_SAMPLING_FRACTION = 0.5
 const SCENARIO_COUNTRY = "Switzerland"
