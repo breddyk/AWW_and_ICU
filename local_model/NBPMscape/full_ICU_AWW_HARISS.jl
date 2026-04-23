@@ -343,33 +343,8 @@ end
         # HARISS is now a single end-of-sample check (see block after the
         # per-day loop), so no weekly-throttle bookkeeping is needed.
 
-        # ── HARISS background-ARI cache (fix 1: one realisation per sample) ──
-        # Previously `secondary_care_td` re-rolled the full background-ARI
-        # hospital population on every weekly HARISS call within this sample,
-        # treating each check as an independent draw. That biased detections
-        # earlier (many lotteries) and inflated variance. We now build a single
-        # cached realisation covering the full observation window and pass it
-        # to every HARISS call in this sample, so the background world stays
-        # consistent across checks -- matching physical reality. ICU / AWW
-        # are unaffected.
-        hariss_bg_cache = NBPMscape.build_ari_background(;
-            max_observation_time            = Float64(max_observation_time),
-            n_hosp_samples_per_week         = n_hosp_samples_per_week,
-            sample_allocation               = P_FROM_CONFIG.sample_allocation,
-            sample_proportion_adult         = P_FROM_CONFIG.sample_proportion_adult,
-            hariss_nhs_trust_sampling_sites = HARISS_SITES_FROM_CONFIG,
-            weight_samples_by               = P_FROM_CONFIG.weight_samples_by,
-            swab_time_mode                  = P_FROM_CONFIG.swab_time_mode,
-            swab_proportion_at_48h          = P_FROM_CONFIG.swab_proportion_at_48h,
-            proportion_hosp_swabbed         = P_FROM_CONFIG.proportion_hosp_swabbed,
-            ed_discharge_limit              = Float64(P_FROM_CONFIG.tdischarge_ed_upper_limit),
-            hosp_short_stay_limit           = Float64(P_FROM_CONFIG.tdischarge_hosp_short_stay_upper_limit),
-            hosp_ari_admissions             = Int(P_FROM_CONFIG.hosp_ari_admissions),
-            hosp_ari_admissions_adult_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
-            hosp_ari_admissions_child_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
-            ed_ari_destinations_adult       = P_FROM_CONFIG.ed_ari_destinations_adult,
-            ed_ari_destinations_child       = P_FROM_CONFIG.ed_ari_destinations_child,
-        )
+        # hariss_bg_cache is built after the per-day loop, only when local cases
+        # exist, so we never pay for it on samples with no local spread.
         
         # Track WW detection for each p_det
         airport_detected = Dict{Float64, Bool}()
@@ -406,76 +381,76 @@ end
             end
             
             # ========================================
-            # LOCAL TRANSMISSION: Seeds from latent (L) and infectious (I) imports
+            # LOCAL TRANSMISSION + ICU: Skip once ICU has detected.
+            # Capping tree growth here is critical for high R0 — without this
+            # guard, sample_infections grows exponentially all the way to
+            # max_observation_time and sampleforest becomes O(n²) overall.
             # ========================================
-            daily_latent_count = latent_import_counts[idx]
-            daily_infectious_count = infectious_import_counts[idx]
-            
-            # Process latent imports (L) - normal seeding (starts from midpoint of latent period)
-            for j in 1:daily_latent_count
-                results = NBPMscape.simtree(base_params,
-                    initialtime = Float64(time) - latent_period / 2.0,
-                    maxtime = max_observation_time,
-                    maxgenerations = 100,
-                    initialcontact = :G
-                )
-                
-                if nrow(results.G) > 0
-                    results.G[1, :generation] = 0
-                    results.G.import_event .= Int(time)
-                    results.G.import_time .= Float64(time)
-                    
-                    if isempty(sample_infections)
-                        sample_infections = results.G
-                    else
-                        append!(sample_infections, results.G)
-                    end
-                end
-            end
-            
-            # Process infectious imports (I) - start immediately infectious, and midway through (no latent period)
-            # Use modified parameters with essentially zero latent period
-            # Set latent_scale to very small value so laglatent ≈ 0, making tinfectious ≈ tinf
-            infectious_params = merge(base_params, (
-                latent_scale = 1e-6,
-                infectious_scale = (infectious_period / 2.0) / fixed_shape,  # Half infectious period remaining
-                latent_shape = fixed_shape
-            ))
-            
-            for j in 1:daily_infectious_count
-                # Start at arrival time, not before
-                results = NBPMscape.simtree(infectious_params,
-                    initialtime = Float64(time),
-                    maxtime = max_observation_time,
-                    maxgenerations = 100,
-                    initialcontact = :G
-                )
-                
-                if nrow(results.G) > 0
-                    results.G[1, :generation] = 0
-                    results.G.import_event .= Int(time)
-                    results.G.import_time .= Float64(time)
-                    # With very small latent_scale, tinfectious ≈ tinf (immediately infectious)
-                    # and tfin ≈ tinf + lagrecovery (no latent period in total duration)
-                    
-                    if isempty(sample_infections)
-                        sample_infections = results.G
-                    else
-                        append!(sample_infections, results.G)
-                    end
-                end
-            end
-            
-            # Check ICU detection after processing this day's imports
-            if !icu_detected_this_sample && !isempty(sample_infections)
-                icu_sampled = NBPMscape.sampleforest(
-                    (G = sample_infections,),
-                    icu_params
-                )
+            if !icu_detected_this_sample
+                daily_latent_count = latent_import_counts[idx]
+                daily_infectious_count = infectious_import_counts[idx]
 
-                if !isempty(icu_sampled.treport)
-                    icu_detected_this_sample = true
-                    first_icu_detection_time = minimum(icu_sampled.treport)
+                # Process latent imports (L) - normal seeding (starts from midpoint of latent period)
+                for j in 1:daily_latent_count
+                    results = NBPMscape.simtree(base_params,
+                        initialtime = Float64(time) - latent_period / 2.0,
+                        maxtime = max_observation_time,
+                        maxgenerations = 100,
+                        initialcontact = :G
+                    )
+
+                    if nrow(results.G) > 0
+                        results.G[1, :generation] = 0
+                        results.G.import_event .= Int(time)
+                        results.G.import_time .= Float64(time)
+
+                        if isempty(sample_infections)
+                            sample_infections = results.G
+                        else
+                            append!(sample_infections, results.G)
+                        end
+                    end
+                end
+
+                # Process infectious imports (I) - start immediately infectious, midway through
+                infectious_params = merge(base_params, (
+                    latent_scale = 1e-6,
+                    infectious_scale = (infectious_period / 2.0) / fixed_shape,
+                    latent_shape = fixed_shape
+                ))
+
+                for j in 1:daily_infectious_count
+                    results = NBPMscape.simtree(infectious_params,
+                        initialtime = Float64(time),
+                        maxtime = max_observation_time,
+                        maxgenerations = 100,
+                        initialcontact = :G
+                    )
+
+                    if nrow(results.G) > 0
+                        results.G[1, :generation] = 0
+                        results.G.import_event .= Int(time)
+                        results.G.import_time .= Float64(time)
+
+                        if isempty(sample_infections)
+                            sample_infections = results.G
+                        else
+                            append!(sample_infections, results.G)
+                        end
+                    end
+                end
+
+                # Check ICU detection after processing this day's imports
+                if !isempty(sample_infections)
+                    icu_sampled = NBPMscape.sampleforest(
+                        (G = sample_infections,),
+                        icu_params
+                    )
+
+                    if !isempty(icu_sampled.treport)
+                        icu_detected_this_sample = true
+                        first_icu_detection_time = minimum(icu_sampled.treport)
+                    end
                 end
             end
 
@@ -503,10 +478,30 @@ end
         end
 
         # ── Single end-of-sample HARISS check ──
-        # Equivalent to weekly checks for detection-time purposes. Weekly
-        # version re-drew HARISS randomness each call; here we draw once per
-        # case, matching how ICU / AWW are treated.
-        if !hariss_detected_this_sample && !isempty(sample_infections)
+        # HARISS requires local (generation > 0) UK cases to route through the
+        # NHS trust → swab → courier → PHL pathway.  Skipping when n_local == 0
+        # avoids the expensive build_ari_background call on samples where the
+        # pathogen never spreads beyond imported cases.
+        n_local = isempty(sample_infections) ? 0 : sum(sample_infections.generation .> 0)
+        if !hariss_detected_this_sample && n_local > 0
+            hariss_bg_cache = NBPMscape.build_ari_background(;
+                max_observation_time             = Float64(max_observation_time),
+                initial_dow                      = P_FROM_CONFIG.initial_dow,
+                n_hosp_samples_per_week          = n_hosp_samples_per_week,
+                sample_allocation                = P_FROM_CONFIG.sample_allocation,
+                sample_proportion_adult          = P_FROM_CONFIG.sample_proportion_adult,
+                hariss_nhs_trust_sampling_sites  = HARISS_SITES_FROM_CONFIG,
+                weight_samples_by                = P_FROM_CONFIG.weight_samples_by,
+                phl_collection_dow               = Vector{Int64}(P_FROM_CONFIG.phl_collection_dow),
+                phl_collection_time              = Float64(P_FROM_CONFIG.phl_collection_time),
+                hosp_to_phl_cutoff_time_relative = P_FROM_CONFIG.hosp_to_phl_cutoff_time_relative,
+                hosp_ari_admissions              = Int(P_FROM_CONFIG.hosp_ari_admissions),
+                hosp_ari_admissions_adult_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
+                hosp_ari_admissions_child_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
+                ed_ari_destinations_adult        = P_FROM_CONFIG.ed_ari_destinations_adult,
+                ed_ari_destinations_child        = P_FROM_CONFIG.ed_ari_destinations_child,
+            )
+
             try
                 sims_for_hariss = sample_infections
                 if !(:simid in propertynames(sims_for_hariss))
