@@ -143,7 +143,8 @@ end
     icu_sampling_proportion::Float64,
     p_det::Float64,
     false_positive_rate::Float64,
-    max_observation_time::Float64;
+    max_observation_time::Float64,
+    hariss_bg_cache;
     mean_infectious_period = 8/3,
     turnaround_time::Float64 = 3.0,
     n_hosp_samples_per_week::Int = Int(P_FROM_CONFIG.n_hosp_samples_per_week),
@@ -273,30 +274,11 @@ end
         icu_detected && aww_detected && break
     end
 
-    # HARISS: only meaningful when local UK cases exist. Build the ARI background
-    # here (not before the loop) so the cost is only paid when there is something
-    # to detect. Samples with no local spread return Inf legitimately.
+    # HARISS: only meaningful when local UK cases exist. hariss_bg_cache is
+    # pre-built once on the main process and passed in — no per-sample cost.
     n_local = isempty(sample_infections) ? 0 : sum(sample_infections.generation .> 0)
 
-    if n_local > 0
-        hariss_bg_cache = NBPMscape.build_ari_background(;
-            max_observation_time            = Float64(max_observation_time),
-            n_hosp_samples_per_week         = n_hosp_samples_per_week,
-            sample_allocation               = P_FROM_CONFIG.sample_allocation,
-            sample_proportion_adult         = P_FROM_CONFIG.sample_proportion_adult,
-            hariss_nhs_trust_sampling_sites = HARISS_SITES_FROM_CONFIG,
-            weight_samples_by               = P_FROM_CONFIG.weight_samples_by,
-            swab_time_mode                  = P_FROM_CONFIG.swab_time_mode,
-            swab_proportion_at_48h          = P_FROM_CONFIG.swab_proportion_at_48h,
-            proportion_hosp_swabbed         = P_FROM_CONFIG.proportion_hosp_swabbed,
-            ed_discharge_limit              = Float64(P_FROM_CONFIG.tdischarge_ed_upper_limit),
-            hosp_short_stay_limit           = Float64(P_FROM_CONFIG.tdischarge_hosp_short_stay_upper_limit),
-            hosp_ari_admissions             = Int(P_FROM_CONFIG.hosp_ari_admissions),
-            hosp_ari_admissions_adult_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
-            hosp_ari_admissions_child_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
-            ed_ari_destinations_adult       = P_FROM_CONFIG.ed_ari_destinations_adult,
-            ed_ari_destinations_child       = P_FROM_CONFIG.ed_ari_destinations_child,
-        )
+    if n_local > 0 && hariss_bg_cache !== nothing
         try
             sims_for_hariss = sample_infections
             if !(:simid in propertynames(sims_for_hariss))
@@ -456,12 +438,34 @@ function run_multitype_comparison(;
     out_dir = dirname(output_path)
     !isempty(out_dir) && !isdir(out_dir) && mkpath(out_dir)
 
-    println("\nStarting pmap over $num_samples samples on $(nworkers()) workers...")
+    println("\nPre-building HARISS ARI background (shared across all samples)...")
+    flush(stdout)
+    t_bg = @elapsed hariss_bg_cache = NBPMscape.build_ari_background(;
+        max_observation_time            = Float64(max_obs_time),
+        n_hosp_samples_per_week         = n_hosp_samples_per_week,
+        sample_allocation               = P_FROM_CONFIG.sample_allocation,
+        sample_proportion_adult         = P_FROM_CONFIG.sample_proportion_adult,
+        hariss_nhs_trust_sampling_sites = HARISS_SITES_FROM_CONFIG,
+        weight_samples_by               = P_FROM_CONFIG.weight_samples_by,
+        swab_time_mode                  = P_FROM_CONFIG.swab_time_mode,
+        swab_proportion_at_48h          = P_FROM_CONFIG.swab_proportion_at_48h,
+        proportion_hosp_swabbed         = P_FROM_CONFIG.proportion_hosp_swabbed,
+        ed_discharge_limit              = Float64(P_FROM_CONFIG.tdischarge_ed_upper_limit),
+        hosp_short_stay_limit           = Float64(P_FROM_CONFIG.tdischarge_hosp_short_stay_upper_limit),
+        hosp_ari_admissions             = Int(P_FROM_CONFIG.hosp_ari_admissions),
+        hosp_ari_admissions_adult_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
+        hosp_ari_admissions_child_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
+        ed_ari_destinations_adult       = P_FROM_CONFIG.ed_ari_destinations_adult,
+        ed_ari_destinations_child       = P_FROM_CONFIG.ed_ari_destinations_child,
+    )
+    @printf("  done in %.1fs\n", t_bg)
     println("max_observation_time = $(round(max_obs_time, digits=1)) days")
+    println("\nStarting pmap over $num_samples samples on $(nworkers()) workers...")
     flush(stdout)
 
+    pool       = CachingPool(workers())
     batch_size = max(1, min(50, num_samples ÷ nworkers()))
-    all_rows = Vector{Any}()
+    all_rows   = Vector{Any}()
     sizehint!(all_rows, num_samples)
     t_start = time()
 
@@ -469,7 +473,7 @@ function run_multitype_comparison(;
         batch_end = min(batch_start + batch_size - 1, num_samples)
         batch_ids = collect(batch_start:batch_end)
 
-        batch_rows = pmap(batch_ids) do sample_id
+        batch_rows = pmap(pool, batch_ids) do sample_id
             simulate_multitype_sample(
                 country_trimmed,
                 country,
@@ -479,21 +483,23 @@ function run_multitype_comparison(;
                 icu_sampling_proportion,
                 p_det,
                 false_positive_rate,
-                max_obs_time;
-                turnaround_time = turnaround_time,
+                max_obs_time,
+                hariss_bg_cache;
+                turnaround_time         = turnaround_time,
                 n_hosp_samples_per_week = n_hosp_samples_per_week,
             )
         end
         append!(all_rows, batch_rows)
 
         elapsed = time() - t_start
-        done = length(all_rows)
-        rate = done / elapsed
-        eta = (num_samples - done) / rate
+        done    = length(all_rows)
+        rate    = done / elapsed
+        eta     = (num_samples - done) / rate
         @printf("  [%4d/%4d] %.1fs elapsed | %.2f samples/s | ETA %.1fs\n",
                 done, num_samples, elapsed, rate, eta)
         flush(stdout)
     end
+    clear!(pool)
 
     df = DataFrame(all_rows)
     CSV.write(output_path, df)
