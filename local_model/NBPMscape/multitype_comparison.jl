@@ -1,19 +1,22 @@
 # ============================================================================
 # multitype_comparison.jl
 #
-# Single-scenario driver: ICU + one AWW arm + HARISS.
+# Single-scenario driver: ICU + two AWW arms + HARISS.
 #
-# AWW: effective p_det = base_pdet × sampling_fraction (true detection from
-#      CSV-seeded detectable imports only). False positives (FPR) apply only
-#      to the AWW *test outcome* layer and do not seed the epidemic.
+# Both AWW arms share the same p_det and the same true-positive draw each day.
 #
-# AWW "detection" time: first day index t2 such that days t1 and t2 are both
-# reported positive with t2 = t1 + 1 (consecutive calendar rows in the
-# country time series). Recorded time is t2 + turnaround (aligned with other
-# channels). After a positive with no positive next day, the streak resets.
+# AWW CTT=1 (no FPR): fires on the first day with a true positive draw.
+#   Recorded time is that day + turnaround_time.
 #
-# Per sample we also store min(ICU time, HARISS time, AWW two-hit time) and
-# which channel achieved that minimum (ties broken AWW < ICU < HARISS).
+# AWW CTT=2 (with FPR): fires on day t2 only when both day t1 and t2 = t1+1
+#   are reported positive (true OR false positive). A gap resets the streak.
+#   Recorded time is t2 + turnaround_time.
+#
+# Per sample we store two earliest-detection summaries:
+#   earliest_detection_time_ctt1 / earliest_surveillance_type_ctt1
+#     = min(CTT=1, ICU, HARISS), ties broken AWW < ICU < HARISS
+#   earliest_detection_time_ctt2 / earliest_surveillance_type_ctt2
+#     = min(CTT=2, ICU, HARISS), ties broken AWW < ICU < HARISS
 # ============================================================================
 
 using Pkg
@@ -188,27 +191,36 @@ end
     hariss_detected = false
     first_hariss_time = Inf
 
-    # hariss_bg_cache is built after the loop, only when local cases exist,
-    # so we never pay for it on samples with no local spread.
+    # CTT=1: single true positive, no FPR.
+    aww_ctt1_detected  = false
+    first_aww_ctt1_time = Inf
 
-    aww_detected = false
-    first_aww_time = Inf
-    prev_aww_positive = false
+    # CTT=2: two consecutive reported positives (true OR false positive), with FPR.
+    aww_ctt2_detected  = false
+    first_aww_ctt2_time = Inf
+    prev_aww_positive  = false   # streak tracker for CTT=2
 
     for (idx, row) in enumerate(eachrow(country_data))
         time = row.time
         time >= max_observation_time && break
 
-        # AWW: always evaluate — cheap Bernoulli draws, independent of the tree.
+        # AWW: both arms share the same true-positive draw each day.
         daily_detectable_count = detectable_import_counts[idx]
         p_true = daily_detectable_count > 0 ? 1.0 - (1.0 - p_det)^daily_detectable_count : 0.0
         true_positive = rand() < p_true
-        reported_positive = true_positive || (!true_positive && rand() < false_positive_rate)
 
+        # CTT=1: single true positive, no FPR.
+        if !aww_ctt1_detected && true_positive
+            aww_ctt1_detected   = true
+            first_aww_ctt1_time = time + turnaround_time
+        end
+
+        # CTT=2: two consecutive reported positives (FPR applies on non-true-positive days).
+        reported_positive = true_positive || (!true_positive && rand() < false_positive_rate)
         if reported_positive
-            if prev_aww_positive && !aww_detected
-                aww_detected = true
-                first_aww_time = time + turnaround_time
+            if prev_aww_positive && !aww_ctt2_detected
+                aww_ctt2_detected   = true
+                first_aww_ctt2_time = time + turnaround_time
             end
             prev_aww_positive = true
         else
@@ -216,11 +228,8 @@ end
         end
 
         # Tree building and ICU: stop once ICU has detected.
-        # This caps sample_infections growth — critical for high R0 where each
-        # simtree call produces a large subtree and sampleforest cost scales with
-        # the total number of accumulated infections.
         if !icu_detected
-            daily_latent_count = latent_import_counts[idx]
+            daily_latent_count    = latent_import_counts[idx]
             daily_infectious_count = infectious_import_counts[idx]
 
             for j in 1:daily_latent_count
@@ -263,19 +272,17 @@ end
             if !isempty(sample_infections)
                 icu_sampled = NBPMscape.sampleforest((G = sample_infections,), icu_params)
                 if !isempty(icu_sampled.treport)
-                    icu_detected = true
+                    icu_detected   = true
                     first_icu_time = minimum(icu_sampled.treport)
                 end
             end
         end
 
-        # Exit once both ICU and AWW have fired. AWW is checked above regardless,
-        # so running the loop past ICU detection while waiting for AWW is cheap.
-        icu_detected && aww_detected && break
+        # Exit once ICU and both AWW arms have all fired (HARISS is post-loop).
+        icu_detected && aww_ctt1_detected && aww_ctt2_detected && break
     end
 
-    # HARISS: only meaningful when local UK cases exist. hariss_bg_cache is
-    # pre-built once on the main process and passed in — no per-sample cost.
+    # HARISS: single end-of-sample call on the accumulated tree.
     n_local = isempty(sample_infections) ? 0 : sum(sample_infections.generation .> 0)
 
     if n_local > 0 && hariss_bg_cache !== nothing
@@ -320,7 +327,7 @@ end
                 if !isempty(sc_td_finite)
                     td_min = minimum(sc_td_finite)
                     if td_min <= max_observation_time
-                        hariss_detected = true
+                        hariss_detected   = true
                         first_hariss_time = td_min
                     end
                 end
@@ -330,9 +337,11 @@ end
         end
     end
 
-    icu_local_cases = NaN
-    hariss_local_cases = NaN
-    aww_local_cases = NaN
+    # Per-channel local case counts at detection.
+    icu_local_cases      = NaN
+    hariss_local_cases   = NaN
+    aww_ctt1_local_cases = NaN
+    aww_ctt2_local_cases = NaN
     if !isempty(sample_infections)
         local_mask = sample_infections.generation .> 0
         if icu_detected && isfinite(first_icu_time)
@@ -341,43 +350,56 @@ end
         if hariss_detected && isfinite(first_hariss_time)
             hariss_local_cases = Float64(sum(local_mask .& (sample_infections.tinf .<= first_hariss_time)))
         end
-        if aww_detected && isfinite(first_aww_time)
-            aww_local_cases = Float64(sum(local_mask .& (sample_infections.tinf .<= first_aww_time)))
+        if aww_ctt1_detected && isfinite(first_aww_ctt1_time)
+            aww_ctt1_local_cases = Float64(sum(local_mask .& (sample_infections.tinf .<= first_aww_ctt1_time)))
+        end
+        if aww_ctt2_detected && isfinite(first_aww_ctt2_time)
+            aww_ctt2_local_cases = Float64(sum(local_mask .& (sample_infections.tinf .<= first_aww_ctt2_time)))
         end
     end
 
-    t_icu = icu_detected && isfinite(first_icu_time) ? Float64(first_icu_time) : Inf
-    t_har = hariss_detected && isfinite(first_hariss_time) ? Float64(first_hariss_time) : Inf
-    t_aww = aww_detected && isfinite(first_aww_time) ? Float64(first_aww_time) : Inf
-    t_min = min(t_icu, t_har, t_aww)
-    earliest_type = if t_min == Inf
-        ""
-    elseif t_min == t_aww && t_aww <= t_icu && t_aww <= t_har
-        "AWW"
-    elseif t_min == t_icu && t_icu <= t_har
-        "ICU"
-    else
-        "HARISS"
+    # Release epidemic tree before returning so GC can collect it before
+    # the next task starts on this worker.
+    sample_infections = DataFrame()
+
+    # Earliest-detection summaries (ties broken AWW < ICU < HARISS).
+    t_icu  = icu_detected    && isfinite(first_icu_time)      ? Float64(first_icu_time)      : Inf
+    t_har  = hariss_detected && isfinite(first_hariss_time)   ? Float64(first_hariss_time)   : Inf
+    t_ctt1 = aww_ctt1_detected && isfinite(first_aww_ctt1_time) ? Float64(first_aww_ctt1_time) : Inf
+    t_ctt2 = aww_ctt2_detected && isfinite(first_aww_ctt2_time) ? Float64(first_aww_ctt2_time) : Inf
+
+    function _earliest_type(t_aww, t_icu, t_har)
+        t_min = min(t_aww, t_icu, t_har)
+        t_min == Inf                                    ? "" :
+        t_min == t_aww && t_aww <= t_icu && t_aww <= t_har ? "AWW" :
+        t_min == t_icu && t_icu <= t_har                ? "ICU" : "HARISS"
     end
 
+    t_min_ctt1 = min(t_ctt1, t_icu, t_har)
+    t_min_ctt2 = min(t_ctt2, t_icu, t_har)
+
     return (
-        sample_id = sample_id,
-        country = country_name,
-        R0 = R0,
-        gen_time = mean_generation_time,
-        p_det = p_det,
-        false_positive_rate = false_positive_rate,
-        icu_detection_time = first_icu_time,
-        icu_local_cases = icu_local_cases,
+        sample_id            = sample_id,
+        country              = country_name,
+        R0                   = R0,
+        gen_time             = mean_generation_time,
+        p_det                = p_det,
+        false_positive_rate  = false_positive_rate,
+        icu_detection_time   = first_icu_time,
+        icu_local_cases      = icu_local_cases,
         hariss_detection_time = first_hariss_time,
-        hariss_local_cases = hariss_local_cases,
-        aww_detection_time = first_aww_time,
-        aww_local_cases = aww_local_cases,
-        earliest_detection_time = t_min == Inf ? NaN : t_min,
-        earliest_surveillance_type = earliest_type,
-        total_latent = Float64(total_latent),
-        total_infectious = Float64(total_infectious),
-        total_detectable = Float64(total_detectable),
+        hariss_local_cases   = hariss_local_cases,
+        aww_ctt1_detection_time = first_aww_ctt1_time,
+        aww_ctt1_local_cases    = aww_ctt1_local_cases,
+        aww_ctt2_detection_time = first_aww_ctt2_time,
+        aww_ctt2_local_cases    = aww_ctt2_local_cases,
+        earliest_detection_time_ctt1      = t_min_ctt1 == Inf ? NaN : t_min_ctt1,
+        earliest_surveillance_type_ctt1   = _earliest_type(t_ctt1, t_icu, t_har),
+        earliest_detection_time_ctt2      = t_min_ctt2 == Inf ? NaN : t_min_ctt2,
+        earliest_surveillance_type_ctt2   = _earliest_type(t_ctt2, t_icu, t_har),
+        total_latent         = Float64(total_latent),
+        total_infectious     = Float64(total_infectious),
+        total_detectable     = Float64(total_detectable),
     )
 end
 
