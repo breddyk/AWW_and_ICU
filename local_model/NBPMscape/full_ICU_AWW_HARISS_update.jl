@@ -491,6 +491,12 @@ end
         end
     end
 
+    # Free the epidemic tree now that all per-sample results are computed.
+    # With 180+ workers each holding a large DataFrame simultaneously, not
+    # releasing here delays GC until after the next task allocates memory,
+    # which can trigger OOM kills on memory-limited clusters.
+    sample_infections = DataFrame()
+
     return (
         sample_id = sample_id,
         icu_detected = icu_detected,
@@ -1307,7 +1313,7 @@ function run_simulations_from_merged_csv(
         # the remaining per-task overhead.
         pool = CachingPool(workers())
         sample_outputs = try
-            pmap(pool, sample_tasks; batch_size = 4) do task
+            pmap(pool, sample_tasks; batch_size = 1) do task
                 ci, sample_id = task
                 spec = combo_specs[ci]
                 try
