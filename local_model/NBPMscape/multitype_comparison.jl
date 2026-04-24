@@ -531,16 +531,17 @@ function run_multitype_comparison(;
 end
 
 
-const SCENARIO_R0 = 2.0
-const SCENARIO_GEN_TIME = 4.0
-const SCENARIO_BASE_PDET = 0.16
+const SCENARIO_R0               = 2.5
+const SCENARIO_GEN_TIME         = 4.0
+const SCENARIO_BASE_PDET        = 0.16
 const SCENARIO_SAMPLING_FRACTION = 0.5
-const SCENARIO_COUNTRY = "Switzerland"
-const AWW_FALSE_POSITIVE_RATE = 0.04
+const SCENARIO_COUNTRY          = "Switzerland"
+const AWW_FALSE_POSITIVE_RATE   = 0.04
 
-project_root    = normpath(joinpath(@__DIR__, "..", ".."))
-input_csv_path  = joinpath(project_root, "global_model/pgfgleam/all_results/global/daily_imports_sensitivity.csv")
-output_csv_path = joinpath(project_root, "global_model/pgfgleam/all_results/local/multi_surveillance_result.csv")
+# ── Edit these two paths for your environment ──────────────────────────────
+input_csv_path  = "/home/users/breddyk/AWW_and_ICU/pgfgleam/daily_imports_sensitivity_new.csv"
+output_csv_path = "/home/users/breddyk/AWW_and_ICU/pgfgleam/multitype_comparison_samples_2.5_4.csv"
+# ───────────────────────────────────────────────────────────────────────────
 
 run_multitype_comparison(;
     csv_path = input_csv_path,
