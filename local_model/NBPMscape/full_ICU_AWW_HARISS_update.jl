@@ -241,7 +241,8 @@ end
     hariss_bg_cache;
     mean_infectious_period = 8/3,
     turnaround_time::Float64 = 3.0,
-    n_hosp_samples_per_week::Int = Int(P_FROM_CONFIG.n_hosp_samples_per_week)
+    n_hosp_samples_per_week::Int = Int(P_FROM_CONFIG.n_hosp_samples_per_week),
+    hariss_extra_days::Float64 = 14.0
 )
     """
     Run ONE Monte-Carlo sample of the ICU + AWW + HARISS simulation.
@@ -314,9 +315,13 @@ end
         first_airport_time[p_det] = Inf
     end
 
+    # Set when ICU + all AWW arms have fired; loop continues for hariss_extra_days
+    # more days so HARISS sees a fuller epidemic before being evaluated.
+    hariss_extra_stop_time = Inf
+
     for (idx, row) in enumerate(eachrow(country_data))
         time = row.time
-        if time >= max_observation_time
+        if time >= max_observation_time || time >= hariss_extra_stop_time
             break
         end
 
@@ -334,11 +339,11 @@ end
             end
         end
 
-        # LOCAL TRANSMISSION + ICU: skip once ICU has detected.
-        # Capping tree growth here is critical for high R0 — without this
-        # guard, sample_infections grows exponentially and sampleforest
-        # becomes O(n²) overall.
-        if !icu_detected
+        # Tree growth: continue while ICU hasn't detected, OR we are still
+        # inside the HARISS grace window (hariss_extra_days after ICU+AWW fire).
+        # This gives HARISS a fairer view of the epidemic without running all
+        # the way to max_observation_time.
+        if !icu_detected || time < hariss_extra_stop_time
             daily_latent_count = latent_import_counts[idx]
             daily_infectious_count = infectious_import_counts[idx]
 
@@ -379,16 +384,16 @@ end
                     end
                 end
             end
+        end
 
-            # ICU detection check (per-day)
-            if !isempty(sample_infections)
-                icu_sampled = NBPMscape.sampleforest(
-                    (G = sample_infections,), icu_params
-                )
-                if !isempty(icu_sampled.treport)
-                    icu_detected = true
-                    first_icu_time = minimum(icu_sampled.treport)
-                end
+        # ICU detection check (per-day, only while not yet detected)
+        if !icu_detected && !isempty(sample_infections)
+            icu_sampled = NBPMscape.sampleforest(
+                (G = sample_infections,), icu_params
+            )
+            if !isempty(icu_sampled.treport)
+                icu_detected = true
+                first_icu_time = minimum(icu_sampled.treport)
             end
         end
 
@@ -399,14 +404,12 @@ end
         # end-of-sample call gives min(treport), which is mathematically
         # identical to the first weekly check that would have fired.
 
-        # EARLY STOPPING — ICU + every AWW arm. HARISS is resolved after the
-        # loop, so it no longer gates early exit here. The per-day loop is
-        # cheap (Poisson import draws + bounded simtree calls), so running
-        # until ICU and AWW have both fired is dominated by the simtree
-        # cost we were already paying.
+        # Once ICU + all AWW arms have detected, start the HARISS grace window
+        # rather than breaking immediately. The loop exit at the top handles
+        # termination once hariss_extra_stop_time is reached.
         all_airport_detected = all(airport_detected[p] for p in airport_detection_probs)
-        if icu_detected && all_airport_detected
-            break
+        if icu_detected && all_airport_detected && isinf(hariss_extra_stop_time)
+            hariss_extra_stop_time = time + hariss_extra_days
         end
     end
 
@@ -592,6 +595,7 @@ end
     mean_infectious_period = 8/3,
     turnaround_time::Float64 = 3.0,
     n_hosp_samples_per_week::Int = Int(P_FROM_CONFIG.n_hosp_samples_per_week),
+    hariss_extra_days::Float64 = 14.0,
     verbose::Bool = true
 )
     if verbose
@@ -634,7 +638,8 @@ end
             hariss_bg_cache;
             mean_infectious_period = mean_infectious_period,
             turnaround_time = turnaround_time,
-            n_hosp_samples_per_week = n_hosp_samples_per_week
+            n_hosp_samples_per_week = n_hosp_samples_per_week,
+            hariss_extra_days = hariss_extra_days
         )
     end
 
@@ -735,7 +740,8 @@ function run_simulations_from_merged_csv(
     icu_sampling_proportion::Float64 = 0.10,
     n_hosp_samples_per_week::Int = Int(P_FROM_CONFIG.n_hosp_samples_per_week),
     output_path::String = "results_aww_icu_hariss.csv",
-    batch_size::Int = 125
+    batch_size::Int = 125,
+    hariss_extra_days::Float64 = 14.0
 )
     """
     Run AWW + ICU + HARISS simulations.
@@ -1328,7 +1334,8 @@ function run_simulations_from_merged_csv(
                         spec.max_obs_time,
                         spec.hariss_bg_cache;
                         turnaround_time = turnaround_time,
-                        n_hosp_samples_per_week = n_hosp_samples_per_week
+                        n_hosp_samples_per_week = n_hosp_samples_per_week,
+                        hariss_extra_days = hariss_extra_days
                     )
                     icu_str = if res.icu_detected && isfinite(res.icu_detection_time)
                         string(round(Float64(res.icu_detection_time), digits=2)) * "d"

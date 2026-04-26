@@ -151,6 +151,7 @@ end
     mean_infectious_period = 8/3,
     turnaround_time::Float64 = 3.0,
     n_hosp_samples_per_week::Int = Int(P_FROM_CONFIG.n_hosp_samples_per_week),
+    hariss_extra_days::Float64 = 14.0,
 )
     infectious_period = mean_infectious_period
     latent_period = mean_generation_time - (0.5 * infectious_period)
@@ -200,9 +201,13 @@ end
     first_aww_ctt2_time = Inf
     prev_aww_positive  = false   # streak tracker for CTT=2
 
+    # Set when ICU + both AWW arms have fired; loop continues for hariss_extra_days
+    # more days so HARISS sees a fuller epidemic before being evaluated.
+    hariss_extra_stop_time = Inf
+
     for (idx, row) in enumerate(eachrow(country_data))
         time = row.time
-        time >= max_observation_time && break
+        (time >= max_observation_time || time >= hariss_extra_stop_time) && break
 
         # AWW: both arms share the same true-positive draw each day.
         daily_detectable_count = detectable_import_counts[idx]
@@ -227,8 +232,9 @@ end
             prev_aww_positive = false
         end
 
-        # Tree building and ICU: stop once ICU has detected.
-        if !icu_detected
+        # Tree growth: continue while ICU hasn't detected, OR we are still
+        # inside the HARISS grace window (hariss_extra_days after ICU+AWW fire).
+        if !icu_detected || time < hariss_extra_stop_time
             daily_latent_count    = latent_import_counts[idx]
             daily_infectious_count = infectious_import_counts[idx]
 
@@ -269,17 +275,21 @@ end
                 end
             end
 
-            if !isempty(sample_infections)
-                icu_sampled = NBPMscape.sampleforest((G = sample_infections,), icu_params)
-                if !isempty(icu_sampled.treport)
-                    icu_detected   = true
-                    first_icu_time = minimum(icu_sampled.treport)
-                end
+        end
+
+        # ICU detection check (per-day, only while not yet detected)
+        if !icu_detected && !isempty(sample_infections)
+            icu_sampled = NBPMscape.sampleforest((G = sample_infections,), icu_params)
+            if !isempty(icu_sampled.treport)
+                icu_detected   = true
+                first_icu_time = minimum(icu_sampled.treport)
             end
         end
 
-        # Exit once ICU and both AWW arms have all fired (HARISS is post-loop).
-        icu_detected && aww_ctt1_detected && aww_ctt2_detected && break
+        # Once ICU + both AWW arms have fired, enter HARISS grace window.
+        if icu_detected && aww_ctt1_detected && aww_ctt2_detected && isinf(hariss_extra_stop_time)
+            hariss_extra_stop_time = time + hariss_extra_days
+        end
     end
 
     # HARISS: single end-of-sample call on the accumulated tree.
@@ -418,6 +428,7 @@ function run_multitype_comparison(;
     sampling_fraction::Float64,
     country::String,
     false_positive_rate::Float64,
+    hariss_extra_days::Float64 = 14.0,
 )
     p_det = base_pdet * sampling_fraction
     println("="^80)
@@ -509,6 +520,7 @@ function run_multitype_comparison(;
                 hariss_bg_cache;
                 turnaround_time         = turnaround_time,
                 n_hosp_samples_per_week = n_hosp_samples_per_week,
+                hariss_extra_days       = hariss_extra_days,
             )
         end
         append!(all_rows, batch_rows)
