@@ -1487,12 +1487,21 @@ function run_simulations_from_merged_csv(
 
         # Filter out nothing results and append to existing results
         valid_results = filter(x -> !isnothing(x), batch_results)
-        
+
         if !isempty(valid_results)
             new_results_df = DataFrame(valid_results)
             append!(results_df, new_results_df)
         end
-        
+
+        # Explicitly release large batch-local objects before GC so the
+        # next batch starts with a clean memory slate on main and workers.
+        sample_outputs = nothing
+        hariss_caches  = nothing
+        combo_specs    = nothing
+        batch_results  = nothing
+        GC.gc()
+        @everywhere GC.gc()
+
         # SAVE AFTER EACH BATCH using safe write function
         save_success = safe_csv_write(output_path, results_df)
         
@@ -1535,7 +1544,7 @@ results = run_simulations_from_merged_csv(
     icu_sampling_proportion = 0.10,
     n_hosp_samples_per_week = Int(P_FROM_CONFIG.n_hosp_samples_per_week),
     output_path = output_csv_path,
-    batch_size = 125
+    batch_size = 40
 )
 
 println("\n✓ ICU + AWW + HARISS simulations complete!")
