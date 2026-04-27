@@ -1552,7 +1552,9 @@ results = run_simulations_from_merged_csv(
     icu_sampling_proportion = 0.10,
     n_hosp_samples_per_week = Int(P_FROM_CONFIG.n_hosp_samples_per_week),
     output_path = output_csv_path,
-    batch_size = 40
+    batch_size = 40,
+    hariss_extra_days = 14.0,
+    max_local_cases = 1000
 )
 
 println("\n✓ ICU + AWW + HARISS simulations complete!")
