@@ -741,7 +741,8 @@ function run_simulations_from_merged_csv(
     n_hosp_samples_per_week::Int = Int(P_FROM_CONFIG.n_hosp_samples_per_week),
     output_path::String = "results_aww_icu_hariss.csv",
     batch_size::Int = 125,
-    hariss_extra_days::Float64 = 14.0
+    hariss_extra_days::Float64 = 14.0,
+    max_local_cases::Int = 1000
 )
     """
     Run AWW + ICU + HARISS simulations.
