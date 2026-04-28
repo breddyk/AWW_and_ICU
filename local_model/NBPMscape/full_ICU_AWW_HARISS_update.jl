@@ -237,10 +237,12 @@ end
     mean_generation_time::Float64,
     icu_sampling_proportion::Float64,
     airport_detection_probs::Vector{Float64},
-    max_observation_time::Float64;
+    max_observation_time::Float64,
+    hariss_bg_cache;
     mean_infectious_period = 8/3,
     turnaround_time::Float64 = 3.0,
-    n_hosp_samples_per_week::Int = Int(P_FROM_CONFIG.n_hosp_samples_per_week)
+    n_hosp_samples_per_week::Int = Int(P_FROM_CONFIG.n_hosp_samples_per_week),
+    hariss_extra_days::Float64 = 14.0
 )
     """
     Run ONE Monte-Carlo sample of the ICU + AWW + HARISS simulation.
@@ -303,33 +305,8 @@ end
     # HARISS is now a single end-of-sample check (see comment below the
     # per-day loop), so no weekly-throttle bookkeeping is needed.
 
-    # ── HARISS background-ARI cache (fix 1: one realisation per sample) ──
-    # Previously `secondary_care_td` re-rolled the full background-ARI
-    # hospital population on every weekly HARISS call within this sample,
-    # treating each check as an independent draw. That biased detections
-    # earlier (many lotteries) and inflated variance. We now build a single
-    # cached realisation covering the full observation window and pass it
-    # to every HARISS call in this sample, so the background world stays
-    # consistent across checks -- matching physical reality. ICU / AWW
-    # are unaffected.
-    hariss_bg_cache = NBPMscape.build_ari_background(;
-        max_observation_time            = Float64(max_observation_time),
-        n_hosp_samples_per_week         = n_hosp_samples_per_week,
-        sample_allocation               = P_FROM_CONFIG.sample_allocation,
-        sample_proportion_adult         = P_FROM_CONFIG.sample_proportion_adult,
-        hariss_nhs_trust_sampling_sites = HARISS_SITES_FROM_CONFIG,
-        weight_samples_by               = P_FROM_CONFIG.weight_samples_by,
-        swab_time_mode                  = P_FROM_CONFIG.swab_time_mode,
-        swab_proportion_at_48h          = P_FROM_CONFIG.swab_proportion_at_48h,
-        proportion_hosp_swabbed         = P_FROM_CONFIG.proportion_hosp_swabbed,
-        ed_discharge_limit              = Float64(P_FROM_CONFIG.tdischarge_ed_upper_limit),
-        hosp_short_stay_limit           = Float64(P_FROM_CONFIG.tdischarge_hosp_short_stay_upper_limit),
-        hosp_ari_admissions             = Int(P_FROM_CONFIG.hosp_ari_admissions),
-        hosp_ari_admissions_adult_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
-        hosp_ari_admissions_child_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
-        ed_ari_destinations_adult       = P_FROM_CONFIG.ed_ari_destinations_adult,
-        ed_ari_destinations_child       = P_FROM_CONFIG.ed_ari_destinations_child,
-    )
+    # hariss_bg_cache is built after the per-day loop, only when local cases
+    # exist, so we never pay for it on samples with no local spread.
 
     airport_detected = Dict{Float64, Bool}()
     first_airport_time = Dict{Float64, Float64}()
@@ -338,9 +315,13 @@ end
         first_airport_time[p_det] = Inf
     end
 
+    # Set when ICU + all AWW arms have fired; loop continues for hariss_extra_days
+    # more days so HARISS sees a fuller epidemic before being evaluated.
+    hariss_extra_stop_time = Inf
+
     for (idx, row) in enumerate(eachrow(country_data))
         time = row.time
-        if time >= max_observation_time
+        if time >= max_observation_time || time >= hariss_extra_stop_time
             break
         end
 
@@ -358,49 +339,54 @@ end
             end
         end
 
-        # LOCAL TRANSMISSION: seeds from latent (L) and infectious (I) imports
-        daily_latent_count = latent_import_counts[idx]
-        daily_infectious_count = infectious_import_counts[idx]
+        # Tree growth: continue while ICU hasn't detected, OR we are still
+        # inside the HARISS grace window (hariss_extra_days after ICU+AWW fire).
+        # This gives HARISS a fairer view of the epidemic without running all
+        # the way to max_observation_time.
+        if !icu_detected || time < hariss_extra_stop_time
+            daily_latent_count = latent_import_counts[idx]
+            daily_infectious_count = infectious_import_counts[idx]
 
-        for j in 1:daily_latent_count
-            results = NBPMscape.simtree(base_params,
-                initialtime = Float64(time) - latent_period / 2.0,
-                maxtime = max_observation_time,
-                maxgenerations = 100,
-                initialcontact = :G
-            )
-            if nrow(results.G) > 0
-                results.G[1, :generation] = 0
-                results.G.import_event .= Int(time)
-                results.G.import_time .= Float64(time)
-                if isempty(sample_infections)
-                    sample_infections = results.G
-                else
-                    append!(sample_infections, results.G)
+            for j in 1:daily_latent_count
+                results = NBPMscape.simtree(base_params,
+                    initialtime = Float64(time) - latent_period / 2.0,
+                    maxtime = max_observation_time,
+                    maxgenerations = 100,
+                    initialcontact = :G
+                )
+                if nrow(results.G) > 0
+                    results.G[1, :generation] = 0
+                    results.G.import_event .= Int(time)
+                    results.G.import_time .= Float64(time)
+                    if isempty(sample_infections)
+                        sample_infections = results.G
+                    else
+                        append!(sample_infections, results.G)
+                    end
+                end
+            end
+
+            for j in 1:daily_infectious_count
+                results = NBPMscape.simtree(infectious_params,
+                    initialtime = Float64(time),
+                    maxtime = max_observation_time,
+                    maxgenerations = 100,
+                    initialcontact = :G
+                )
+                if nrow(results.G) > 0
+                    results.G[1, :generation] = 0
+                    results.G.import_event .= Int(time)
+                    results.G.import_time .= Float64(time)
+                    if isempty(sample_infections)
+                        sample_infections = results.G
+                    else
+                        append!(sample_infections, results.G)
+                    end
                 end
             end
         end
 
-        for j in 1:daily_infectious_count
-            results = NBPMscape.simtree(infectious_params,
-                initialtime = Float64(time),
-                maxtime = max_observation_time,
-                maxgenerations = 100,
-                initialcontact = :G
-            )
-            if nrow(results.G) > 0
-                results.G[1, :generation] = 0
-                results.G.import_event .= Int(time)
-                results.G.import_time .= Float64(time)
-                if isempty(sample_infections)
-                    sample_infections = results.G
-                else
-                    append!(sample_infections, results.G)
-                end
-            end
-        end
-
-        # ICU detection check (per-day)
+        # ICU detection check (per-day, only while not yet detected)
         if !icu_detected && !isempty(sample_infections)
             icu_sampled = NBPMscape.sampleforest(
                 (G = sample_infections,), icu_params
@@ -418,27 +404,20 @@ end
         # end-of-sample call gives min(treport), which is mathematically
         # identical to the first weekly check that would have fired.
 
-        # EARLY STOPPING — ICU + every AWW arm. HARISS is resolved after the
-        # loop, so it no longer gates early exit here. The per-day loop is
-        # cheap (Poisson import draws + bounded simtree calls), so running
-        # until ICU and AWW have both fired is dominated by the simtree
-        # cost we were already paying.
+        # Once ICU + all AWW arms have detected, start the HARISS grace window
+        # rather than breaking immediately. The loop exit at the top handles
+        # termination once hariss_extra_stop_time is reached.
         all_airport_detected = all(airport_detected[p] for p in airport_detection_probs)
-        if icu_detected && all_airport_detected
-            break
+        if icu_detected && all_airport_detected && isinf(hariss_extra_stop_time)
+            hariss_extra_stop_time = time + hariss_extra_days
         end
     end
 
     # ── Single end-of-sample HARISS check ──
-    # Equivalent to weekly checks: first detection time is min(treport) over
-    # all outbreak cases sampled across the full trajectory, and min(treport)
-    # from one call over the final `sample_infections` gives the same answer
-    # as the min over N weekly snapshots (each weekly snapshot is a prefix of
-    # the final trajectory, so its min(treport) >= final min(treport)). The
-    # weekly version additionally re-drew HARISS randomness each call; here
-    # we draw once per case, matching how ICU / AWW are treated and giving
-    # a single realised sampling world per sample.
-    if !isempty(sample_infections)
+    # HARISS requires local (generation > 0) UK cases; skip when there are
+    # none (legitimate Inf). hariss_bg_cache is passed in pre-built.
+    n_local = isempty(sample_infections) ? 0 : sum(sample_infections.generation .> 0)
+    if n_local > 0 && hariss_bg_cache !== nothing
         try
             sims_for_hariss = sample_infections
             if !(:simid in propertynames(sims_for_hariss))
@@ -514,6 +493,12 @@ end
             end
         end
     end
+
+    # Free the epidemic tree now that all per-sample results are computed.
+    # With 180+ workers each holding a large DataFrame simultaneously, not
+    # releasing here delays GC until after the next task allocates memory,
+    # which can trigger OOM kills on memory-limited clusters.
+    sample_infections = DataFrame()
 
     return (
         sample_id = sample_id,
@@ -610,6 +595,7 @@ end
     mean_infectious_period = 8/3,
     turnaround_time::Float64 = 3.0,
     n_hosp_samples_per_week::Int = Int(P_FROM_CONFIG.n_hosp_samples_per_week),
+    hariss_extra_days::Float64 = 14.0,
     verbose::Bool = true
 )
     if verbose
@@ -620,6 +606,25 @@ end
         println("    HARISS samples/week: $(n_hosp_samples_per_week)")
     end
 
+    hariss_bg_cache = NBPMscape.build_ari_background(;
+        max_observation_time            = Float64(max_observation_time),
+        n_hosp_samples_per_week         = n_hosp_samples_per_week,
+        sample_allocation               = P_FROM_CONFIG.sample_allocation,
+        sample_proportion_adult         = P_FROM_CONFIG.sample_proportion_adult,
+        hariss_nhs_trust_sampling_sites = HARISS_SITES_FROM_CONFIG,
+        weight_samples_by               = P_FROM_CONFIG.weight_samples_by,
+        swab_time_mode                  = P_FROM_CONFIG.swab_time_mode,
+        swab_proportion_at_48h          = P_FROM_CONFIG.swab_proportion_at_48h,
+        proportion_hosp_swabbed         = P_FROM_CONFIG.proportion_hosp_swabbed,
+        ed_discharge_limit              = Float64(P_FROM_CONFIG.tdischarge_ed_upper_limit),
+        hosp_short_stay_limit           = Float64(P_FROM_CONFIG.tdischarge_hosp_short_stay_upper_limit),
+        hosp_ari_admissions             = Int(P_FROM_CONFIG.hosp_ari_admissions),
+        hosp_ari_admissions_adult_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
+        hosp_ari_admissions_child_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
+        ed_ari_destinations_adult       = P_FROM_CONFIG.ed_ari_destinations_adult,
+        ed_ari_destinations_child       = P_FROM_CONFIG.ed_ari_destinations_child,
+    )
+
     sample_results = Vector{Any}(undef, num_samples)
     for sample in 1:num_samples
         if verbose && (sample % 10 == 0 || sample == 1)
@@ -629,10 +634,12 @@ end
         sample_results[sample] = simulate_single_sample(
             country_data, country_name, sample,
             R0, mean_generation_time, icu_sampling_proportion,
-            airport_detection_probs, max_observation_time;
+            airport_detection_probs, max_observation_time,
+            hariss_bg_cache;
             mean_infectious_period = mean_infectious_period,
             turnaround_time = turnaround_time,
-            n_hosp_samples_per_week = n_hosp_samples_per_week
+            n_hosp_samples_per_week = n_hosp_samples_per_week,
+            hariss_extra_days = hariss_extra_days
         )
     end
 
@@ -733,7 +740,9 @@ function run_simulations_from_merged_csv(
     icu_sampling_proportion::Float64 = 0.10,
     n_hosp_samples_per_week::Int = Int(P_FROM_CONFIG.n_hosp_samples_per_week),
     output_path::String = "results_aww_icu_hariss.csv",
-    batch_size::Int = 125
+    batch_size::Int = 125,
+    hariss_extra_days::Float64 = 14.0,
+    max_local_cases::Int = 1000
 )
     """
     Run AWW + ICU + HARISS simulations.
@@ -1205,7 +1214,9 @@ function run_simulations_from_merged_csv(
         # here (instead of inside every pmap task) avoids re-scanning the
         # 900k-row merged table from every worker, every sample.
         # --------------------------------------------------------------
-        combo_specs = NamedTuple[]
+        # Phase 1a: data filtering (sequential, fast — avoids re-scanning
+        # the merged table from workers).
+        combo_specs_no_cache = NamedTuple[]
         for (i, param_row) in enumerate(eachrow(batch_combinations))
             global_idx = batch_start + i - 1
             R0 = Float64(param_row.R0)
@@ -1234,16 +1245,48 @@ function run_simulations_from_merged_csv(
                 continue
             end
 
-            push!(combo_specs, (
-                global_idx = global_idx,
-                country = country,
-                R0 = R0,
-                gen_time = gen_time,
+            push!(combo_specs_no_cache, (
+                global_idx    = global_idx,
+                country       = country,
+                R0            = R0,
+                gen_time      = gen_time,
                 mean_det_time = mean_det_time,
-                max_obs_time = max_obs_time,
-                country_data = country_trimmed
+                max_obs_time  = max_obs_time,
+                country_data  = country_trimmed,
             ))
         end
+
+        # Phase 1b: build one hariss_bg_cache per combination in parallel.
+        # build_ari_background is independent of importation data — only
+        # max_obs_time varies per combo; all other params are NHS config
+        # constants already resident on every worker. With 180 workers all
+        # 125 builds run simultaneously (~1 round × 7-10s) rather than
+        # sequentially on the main process (125 × 7-10s ≈ 950s).
+        println("  Pre-building $(length(combo_specs_no_cache)) HARISS background caches in parallel...")
+        flush(stdout)
+        hariss_caches = pmap(combo_specs_no_cache) do spec
+            NBPMscape.build_ari_background(;
+                max_observation_time            = Float64(spec.max_obs_time),
+                n_hosp_samples_per_week         = n_hosp_samples_per_week,
+                sample_allocation               = P_FROM_CONFIG.sample_allocation,
+                sample_proportion_adult         = P_FROM_CONFIG.sample_proportion_adult,
+                hariss_nhs_trust_sampling_sites = HARISS_SITES_FROM_CONFIG,
+                weight_samples_by               = P_FROM_CONFIG.weight_samples_by,
+                swab_time_mode                  = P_FROM_CONFIG.swab_time_mode,
+                swab_proportion_at_48h          = P_FROM_CONFIG.swab_proportion_at_48h,
+                proportion_hosp_swabbed         = P_FROM_CONFIG.proportion_hosp_swabbed,
+                ed_discharge_limit              = Float64(P_FROM_CONFIG.tdischarge_ed_upper_limit),
+                hosp_short_stay_limit           = Float64(P_FROM_CONFIG.tdischarge_hosp_short_stay_upper_limit),
+                hosp_ari_admissions             = Int(P_FROM_CONFIG.hosp_ari_admissions),
+                hosp_ari_admissions_adult_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
+                hosp_ari_admissions_child_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
+                ed_ari_destinations_adult       = P_FROM_CONFIG.ed_ari_destinations_adult,
+                ed_ari_destinations_child       = P_FROM_CONFIG.ed_ari_destinations_child,
+            )
+        end
+
+        combo_specs = [(; spec..., hariss_bg_cache = cache)
+                       for (spec, cache) in zip(combo_specs_no_cache, hariss_caches)]
 
         if isempty(combo_specs)
             println("No valid combinations in this batch, skipping.")
@@ -1277,7 +1320,7 @@ function run_simulations_from_merged_csv(
         # the remaining per-task overhead.
         pool = CachingPool(workers())
         sample_outputs = try
-            pmap(pool, sample_tasks; batch_size = 4) do task
+            pmap(pool, sample_tasks; batch_size = 1) do task
                 ci, sample_id = task
                 spec = combo_specs[ci]
                 try
@@ -1289,9 +1332,11 @@ function run_simulations_from_merged_csv(
                         spec.gen_time,
                         icu_sampling_proportion,
                         p_dets,
-                        spec.max_obs_time;
+                        spec.max_obs_time,
+                        spec.hariss_bg_cache;
                         turnaround_time = turnaround_time,
-                        n_hosp_samples_per_week = n_hosp_samples_per_week
+                        n_hosp_samples_per_week = n_hosp_samples_per_week,
+                        hariss_extra_days = hariss_extra_days
                     )
                     icu_str = if res.icu_detected && isfinite(res.icu_detection_time)
                         string(round(Float64(res.icu_detection_time), digits=2)) * "d"
@@ -1450,12 +1495,21 @@ function run_simulations_from_merged_csv(
 
         # Filter out nothing results and append to existing results
         valid_results = filter(x -> !isnothing(x), batch_results)
-        
+
         if !isempty(valid_results)
             new_results_df = DataFrame(valid_results)
             append!(results_df, new_results_df)
         end
-        
+
+        # Explicitly release large batch-local objects before GC so the
+        # next batch starts with a clean memory slate on main and workers.
+        sample_outputs = nothing
+        hariss_caches  = nothing
+        combo_specs    = nothing
+        batch_results  = nothing
+        GC.gc()
+        @everywhere GC.gc()
+
         # SAVE AFTER EACH BATCH using safe write function
         save_success = safe_csv_write(output_path, results_df)
         
@@ -1485,9 +1539,9 @@ end
 # ============================================================================
 
 # Resolve paths relative to the repository root so the script is portable
-project_root = normpath(joinpath(@__DIR__, "..", ".."))
-input_csv_path = "/Users/reddy/AWW_and_ICU/global_model/pgfgleam/all_results/global/daily_imports_sensitivity.csv"
-output_csv_path = "/Users/reddy/AWW_and_ICU/global_model/pgfgleam/all_results/local/full_ICU_AWW_HARISS_result.csv"
+project_root    = normpath(joinpath(@__DIR__, "..", ".."))
+input_csv_path  = joinpath(project_root, "global_model", "pgfgleam", "all_results", "global", "daily_imports_sensitivity.csv")
+output_csv_path = joinpath(project_root, "global_model", "pgfgleam", "all_results", "local", "full_ICU_AWW_HARISS_result.csv")
 
 results = run_simulations_from_merged_csv(
     input_csv_path;
