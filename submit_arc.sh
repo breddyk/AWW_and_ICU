@@ -4,8 +4,8 @@
 #SBATCH --partition=long
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=128G
+#SBATCH --cpus-per-task=48
+#SBATCH --mem=192G
 #SBATCH --time=48:00:00
 #SBATCH --output=/data/biol-epi/%u/AWW_and_ICU/logs/aww_%j.out
 #SBATCH --error=/data/biol-epi/%u/AWW_and_ICU/logs/aww_%j.err
