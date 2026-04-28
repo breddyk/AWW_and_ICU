@@ -1,16 +1,23 @@
 NHS_Trust_code,ICU_site_name,public_health_laboratory
-DM1,DUMMY1,DUMMY1
-DM2,DUMMY2,DUMMY2
-DM3,DUMMY3,DUMMY3
-DM4,DUMMY4,DUMMY4
-DM5,DUMMY5,DUMMY5
-DM6,DUMMY6,DUMMY6
-DM7,DUMMY7,DUMMY7
-DM8,DUMMY8,DUMMY8
-DM9,DUMMY9,DUMMY9
-DM10,DUMMY10,DUMMY10
-DM11,DUMMY11,DUMMY11
-DM12,DUMMY12,DUMMY12
-DM13,DUMMY13,DUMMY13
-DM14,DUMMY14,DUMMY14
-DM15,DUMMY15,DUMMY15
+RRK,University Hospitals Birmingham NHS Foundation Trust,Birmingham
+RVJ,North Bristol NHS Trust,Bristol
+RA7,University Hospitals Bristol and Weston NHS Foundation Trust,Bristol
+RD1,Royal United Hospitals Bath NHS Foundation Trust,Bristol
+RDU,Frimley Health NHS Foundation Trust,Frimley
+RYJ,Imperial College Healthcare NHS Trust,Imperial
+RR8,Leeds Teaching Hospitals NHS Trust,Leeds
+RXF,Mid Yorkshire Hospitals NHS Trust,Leeds
+RWY,Calderdale and Huddersfield NHS Foundation Trust,Leeds
+RWE,University Hospitals of Leicester NHS Trust,Leicester
+RTF,Northumbria Healthcare NHS Foundation Trust,Northumbria
+RGT,Cambridge University Hospitals NHS Foundation Trust,Cambridge
+R0A,Manchester University NHS Foundation Trust,Manchester
+RM3,Northern Care Alliance NHS Foundation Trust,Manchester
+RMP,Tameside And Glossop Integrated Care NHS Foundation Trust,Manchester
+RBV,The Christie NHS Foundation Trust,Manchester
+RTD,The Newcastle Upon Tyne Hospitals NHS Foundation Trust,Newcastle
+RX1,Nottingham University Hospitals NHS Trust,Nottingham
+RTH,Oxford University Hospitals NHS Foundation Trust,Oxford
+RAL,Royal Free London NHS Foundation Trust,Royal Free
+RHQ,Sheffield Teaching Hospitals NHS Foundation Trust,Sheffield
+RHM,University Hospital Southampton NHS Foundation Trust,Southampton
