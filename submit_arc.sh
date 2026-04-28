@@ -14,7 +14,7 @@
 
 # ── environment ──────────────────────────────────────────────────────────────
 module purge
-module load Julia/1.10.0-linux-x86_64     # check with: module spider julia
+module load Julia/1.12.1-linux-x86_64
 
 REPO=/data/biol-epi/${USER}/AWW_and_ICU
 
@@ -25,8 +25,8 @@ mkdir -p "${REPO}/global_model/pgfgleam/all_results/local"
 julia --project="${REPO}/local_model" -e 'using Pkg; Pkg.instantiate()'
 
 # ── run ──────────────────────────────────────────────────────────────────────
-# --threads=auto uses all cpus-per-task cores for Julia threading.
-# addprocs inside the script spawns 31 workers (cpus-per-task - 1).
+# The Julia script reads SLURM_CPUS_PER_TASK and calls addprocs(n-1),
+# so workers always match the allocated cores automatically.
 julia --project="${REPO}/local_model" \
       --threads=auto \
       "${REPO}/local_model/NBPMscape/full_ICU_AWW_HARISS_update.jl"

@@ -55,7 +55,9 @@ using CSV
 using Distributed
 using Dates
 
-addprocs(180)
+let n = haskey(ENV, "SLURM_CPUS_PER_TASK") ? parse(Int, ENV["SLURM_CPUS_PER_TASK"]) - 1 : 180
+    addprocs(n)
+end
 
 @everywhere using Pkg
 @everywhere Pkg.activate($_PROJECT_DIR)
