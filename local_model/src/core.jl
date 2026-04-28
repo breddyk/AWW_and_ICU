@@ -1,4 +1,4 @@
-default(;lw = 4)
+# Plots.default(;lw = 4)  # removed: Plots is no longer imported in NBPMscape.jl
 
 const MAXDURATION = 180.0
 

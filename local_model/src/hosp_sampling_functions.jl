@@ -38,6 +38,246 @@ function courier_collection_times(; initial_dow::Integer, n_weeks::Integer, coll
 end
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal helpers supporting the HARISS background-ARI cache (see
+# `build_ari_background` below). Factored out of `sample_hosp_cases_n` so the
+# same code path is used when the cache is built once-per-sample and when
+# `sample_hosp_cases_n` falls back to regenerating the background itself.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Allocate PHL sample targets from the HARISS network + weighting config.
+# Mirrors the block that used to live inline in sample_hosp_cases_n.
+function _build_phl_sample_targets(; n_hosp_samples_per_week::Int
+                                   , sample_allocation::String
+                                   , sample_proportion_adult
+                                   , hariss_nhs_trust_sampling_sites::DataFrame
+                                   , weight_samples_by::String
+                                   , nhs_trust_catchment_pop
+                                   , hosp_ari_admissions::Int
+                                   , hosp_ari_admissions_adult_p::Float64
+                                   , hosp_ari_admissions_child_p::Float64
+                                   )
+    nhs_trust_site_sample_targets = copy(hariss_nhs_trust_sampling_sites)
+    nhs_trust_site_sample_targets = nhs_trust_site_sample_targets[nhs_trust_site_sample_targets[:, 1] .!= "NA", :]
+
+    if weight_samples_by == "catchment_pop"
+        rename!(nhs_trust_catchment_pop, :TrustCode => :NHS_Trust_code)
+        nhs_trust_site_sample_targets = innerjoin(nhs_trust_site_sample_targets, nhs_trust_catchment_pop, on = :NHS_Trust_code)
+        nhs_trust_site_sample_targets_groupby_phl = groupby(nhs_trust_site_sample_targets, :public_health_laboratory)
+        phl_sample_targets = combine(nhs_trust_site_sample_targets_groupby_phl, :public_health_laboratory, :catchment_prop_of_total_sum => sum => :catchment_prop_of_total_pop)
+        phl_sample_targets = unique(phl_sample_targets)
+        phl_sample_targets[!, :catchment_pop_prop_of_phls] .= phl_sample_targets.catchment_prop_of_total_pop ./ sum(phl_sample_targets.catchment_prop_of_total_pop)
+        # Also compute the ae_mean column used for bkg admissions estimation below
+        phl_sample_targets[!, :phl_sum_mean_12m_prop] .= phl_sample_targets.catchment_prop_of_total_pop  # proxy so est_weekly_bkg_hosp_ari_admissions below works
+        if sample_allocation == "equal"
+            phl_sample_targets[!, :sample_target_per_week] .= Int(round(n_hosp_samples_per_week / nrow(phl_sample_targets); digits = 0))
+        elseif sample_allocation == "weighted"
+            phl_sample_targets[!, :sample_target_per_week] = allocate_with_rounding(total = n_hosp_samples_per_week, weights = phl_sample_targets.catchment_pop_prop_of_phls)
+        end
+
+    elseif weight_samples_by == "ae_mean"
+        nhs_trust_site_sample_targets = innerjoin(nhs_trust_site_sample_targets, AE_12M[:, [:NHS_Trust_code, :mean_12m_prop]], on = :NHS_Trust_code)
+        nhs_trust_site_sample_targets_groupby_phl = groupby(nhs_trust_site_sample_targets, :public_health_laboratory)
+        phl_sample_targets = combine(nhs_trust_site_sample_targets_groupby_phl, :public_health_laboratory, :mean_12m_prop => sum => :phl_sum_mean_12m_prop)
+        phl_sample_targets = unique(phl_sample_targets)
+        phl_sample_targets[!, :ae_12m_mean_prop_of_phls] .= phl_sample_targets.phl_sum_mean_12m_prop ./ sum(phl_sample_targets.phl_sum_mean_12m_prop)
+        if sample_allocation == "equal"
+            phl_sample_targets[!, :sample_target_per_week] .= Int(round(n_hosp_samples_per_week / nrow(phl_sample_targets); digits = 0))
+        elseif sample_allocation == "weighted"
+            phl_sample_targets[!, :sample_target_per_week] = allocate_with_rounding(total = n_hosp_samples_per_week, weights = phl_sample_targets.ae_12m_mean_prop_of_phls)
+        end
+    end
+
+    insertcols!(phl_sample_targets, :sample_target_per_week_adult => -1)
+    insertcols!(phl_sample_targets, :sample_target_per_week_child => -1)
+    if sample_proportion_adult != "free"
+        for i in 1:nrow(phl_sample_targets)
+            phl_sample_targets[i, [:sample_target_per_week_adult, :sample_target_per_week_child]] =
+                allocate_with_rounding(total = phl_sample_targets[!, :sample_target_per_week][i],
+                                       weights = [sample_proportion_adult, (1 - sample_proportion_adult)])
+        end
+    end
+
+    # Estimate weekly background ARI admissions per PHL
+    phl_sample_targets[!, :est_weekly_bkg_hosp_ari_admissions]       = Int.(round.(hosp_ari_admissions .* phl_sample_targets.phl_sum_mean_12m_prop))
+    phl_sample_targets[!, :est_weekly_bkg_hosp_ari_admissions_adult] = Int.(round.(hosp_ari_admissions_adult_p .* phl_sample_targets.est_weekly_bkg_hosp_ari_admissions))
+    phl_sample_targets[!, :est_weekly_bkg_hosp_ari_admissions_child] = Int.(round.(hosp_ari_admissions_child_p .* phl_sample_targets.est_weekly_bkg_hosp_ari_admissions))
+
+    return phl_sample_targets
+end
+
+# Build the 48h-filtered background-ARI swab DataFrame.
+# Optimization 3: preallocate columns and fill by index instead of appending
+# ~2*n_phl*max_week small DataFrames (avoids O(N^2) DataFrame growth).
+# RNG call order is preserved identically to the original inline loop so
+# the stochastic output is unchanged for a given seed.
+function _build_ari_bkg_df(; phl_sample_targets::DataFrame
+                          , max_week::Int
+                          , proportion_hosp_swabbed::Real
+                          , ed_ari_destinations_adult::DataFrame
+                          , ed_ari_destinations_child::DataFrame
+                          , tswab_dists_bkg
+                          )
+    n_phl = nrow(phl_sample_targets)
+    phl_names = Vector{String}(undef, n_phl)
+    n_adult_per_phl = Vector{Int}(undef, n_phl)
+    n_child_per_phl = Vector{Int}(undef, n_phl)
+    for j in 1:n_phl
+        phl_names[j] = String(phl_sample_targets[j, :public_health_laboratory])
+        n_adult_per_phl[j] = Int(round(phl_sample_targets[j, :est_weekly_bkg_hosp_ari_admissions_adult] * proportion_hosp_swabbed; digits = 0))
+        n_child_per_phl[j] = Int(round(phl_sample_targets[j, :est_weekly_bkg_hosp_ari_admissions_child] * proportion_hosp_swabbed; digits = 0))
+    end
+    n_total = (sum(n_adult_per_phl) + sum(n_child_per_phl)) * max_week
+
+    phl_col     = Vector{String}(undef, n_total)
+    age_col     = Vector{String}(undef, n_total)
+    thosp_col   = Vector{Float64}(undef, n_total)
+    tswab_col   = Vector{Float64}(undef, n_total)
+    ed_dest_col = Vector{Symbol}(undef, n_total)
+
+    pos = 1
+    for j in 1:n_phl
+        phl_name = phl_names[j]
+        n_a = n_adult_per_phl[j]
+        n_c = n_child_per_phl[j]
+        for wn in 1:max_week
+            # RNG order preserved: adult wsample → child wsample → adult rand(thosp) →
+            # child rand(thosp) → adult rand.(tswab) → child rand.(tswab)
+            ED_a = wsample(ed_ari_destinations_adult[:, 1], ed_ari_destinations_adult[:, 2], n_a)
+            ED_c = wsample(ed_ari_destinations_child[:, 1], ed_ari_destinations_child[:, 2], n_c)
+            thosp_a = (wn - 1) * 7 .+ rand(n_a) .* 7
+            thosp_c = (wn - 1) * 7 .+ rand(n_c) .* 7
+            tswab_a = thosp_a .+ rand.(getindex.(Ref(tswab_dists_bkg), ED_a))
+            tswab_c = thosp_c .+ rand.(getindex.(Ref(tswab_dists_bkg), ED_c))
+
+            if n_a > 0
+                r_a = pos:(pos + n_a - 1)
+                phl_col[r_a]     .= phl_name
+                age_col[r_a]     .= "adult"
+                thosp_col[r_a]   .= thosp_a
+                tswab_col[r_a]   .= tswab_a
+                ed_dest_col[r_a] .= ED_a
+                pos += n_a
+            end
+            if n_c > 0
+                r_c = pos:(pos + n_c - 1)
+                phl_col[r_c]     .= phl_name
+                age_col[r_c]     .= "child"
+                thosp_col[r_c]   .= thosp_c
+                tswab_col[r_c]   .= tswab_c
+                ed_dest_col[r_c] .= ED_c
+                pos += n_c
+            end
+        end
+    end
+
+    df = DataFrame(
+        pid                      = fill("background_ari", n_total),
+        public_health_laboratory = phl_col,
+        age_group                = age_col,
+        thosp                    = thosp_col,
+        tswab                    = tswab_col,
+        ED_destination           = ed_dest_col,
+    )
+
+    # 48h filter (same semantics as original)
+    tswab_diff = df.tswab .- df.thosp
+    df.tswab_sub_48h = Bool.(tswab_diff .< (48.0 / 24.0))
+    return filter(row -> row.tswab_sub_48h == true, df)
+end
+
+# Pre-group a PHL-keyed DataFrame into a Dict for O(1) PHL lookup.
+# Used by optimization 4 below so the courier cut-off loop does not filter
+# the full DataFrame once per PHL per cut-off.
+function _group_df_by_phl(df::DataFrame)
+    d = Dict{String, DataFrame}()
+    if nrow(df) == 0
+        return d
+    end
+    for g in groupby(df, :public_health_laboratory)
+        phl = String(first(g[!, :public_health_laboratory]))
+        d[phl] = DataFrame(g)
+    end
+    return d
+end
+
+"""
+Function:   build_ari_background
+
+Description:    Precomputes the background ARI hospital-swab realisation for a single
+                Monte-Carlo sample. Call this ONCE per sample (before any HARISS
+                checks) and pass the returned NamedTuple to `secondary_care_td`
+                via the `precomputed_ari_bg` kwarg. This fixes the HARISS
+                modelling inconsistency in which the background ARI population
+                was re-rolled on every weekly HARISS call within a sample, and
+                additionally avoids re-simulating the background for every
+                call (which drove a ~O(n_weeks^2) growth in HARISS cost).
+
+Returns:    NamedTuple with fields
+            - bg_df::DataFrame                 # 48h-filtered background swabs
+            - bg_by_phl::Dict{String,DataFrame}# same rows grouped by PHL
+            - phl_sample_targets::DataFrame    # PHL sample allocation table
+            - max_week::Int                    # number of weeks simulated
+"""
+function build_ari_background(; max_observation_time::Real
+                              , n_hosp_samples_per_week::Int
+                              , sample_allocation::String = "equal"
+                              , sample_proportion_adult = "free"
+                              , hariss_nhs_trust_sampling_sites::DataFrame
+                              , weight_samples_by::String = "ae_mean"
+                              , swab_time_mode::Real = 0.25
+                              , swab_proportion_at_48h::Real = 0.9
+                              , proportion_hosp_swabbed::Real = 0.9
+                              , ed_discharge_limit::Float64 = NBPMscape.P.tdischarge_ed_upper_limit
+                              , hosp_short_stay_limit::Float64 = NBPMscape.P.tdischarge_hosp_short_stay_upper_limit
+                              , nhs_trust_catchment_pop = NHS_TRUST_CATCHMENT_POP_ADULT_CHILD
+                              , hosp_ari_admissions::Int
+                              , hosp_ari_admissions_adult_p::Float64 = 0.52
+                              , hosp_ari_admissions_child_p::Float64 = 0.48
+                              , ed_ari_destinations_adult::DataFrame
+                              , ed_ari_destinations_child::DataFrame
+                              )
+    max_week = Int(ceil(max_observation_time / 7) + 1)
+
+    phl_sample_targets = _build_phl_sample_targets(
+        n_hosp_samples_per_week       = n_hosp_samples_per_week,
+        sample_allocation             = sample_allocation,
+        sample_proportion_adult       = sample_proportion_adult,
+        hariss_nhs_trust_sampling_sites = hariss_nhs_trust_sampling_sites,
+        weight_samples_by             = weight_samples_by,
+        nhs_trust_catchment_pop       = nhs_trust_catchment_pop,
+        hosp_ari_admissions           = hosp_ari_admissions,
+        hosp_ari_admissions_adult_p   = hosp_ari_admissions_adult_p,
+        hosp_ari_admissions_child_p   = hosp_ari_admissions_child_p,
+    )
+
+    swab_time_gamma_d = gamma_params_from_mode_cdf(
+        mode_val = swab_time_mode,
+        cdf_at_2 = swab_proportion_at_48h,
+        lower_shape = 1.0 + 1e-6,
+        upper_shape = 10,
+    )
+    tswab_dists_bkg = Dict(
+        :discharged  => Truncated(swab_time_gamma_d, 0.0, ed_discharge_limit),
+        :short_stay  => Truncated(swab_time_gamma_d, 0.0, hosp_short_stay_limit),
+        :longer_stay => swab_time_gamma_d,
+    )
+
+    bg_df = _build_ari_bkg_df(
+        phl_sample_targets        = phl_sample_targets,
+        max_week                  = max_week,
+        proportion_hosp_swabbed   = proportion_hosp_swabbed,
+        ed_ari_destinations_adult = ed_ari_destinations_adult,
+        ed_ari_destinations_child = ed_ari_destinations_child,
+        tswab_dists_bkg           = tswab_dists_bkg,
+    )
+
+    bg_by_phl = _group_df_by_phl(bg_df)
+
+    return (bg_df = bg_df, bg_by_phl = bg_by_phl,
+            phl_sample_targets = phl_sample_targets, max_week = max_week)
+end
+
 
 """
 Function:   sample_hosp_cases_n
@@ -265,6 +505,11 @@ function sample_hosp_cases_n(; p = NBPMscape.P
                                 , phl_collection_dow::Vector{Int64} = [2,5] # Day(s) of week that swab samples will be collected from public health labs. Day of week codes: Sunday = 1,... Saturday = 7.
                                 , phl_collection_time = 0.5 # Default is midday (=0.5)
                                 , hosp_to_phl_cutoff_time_relative = 1 # Default is 1 day (24 hrs) prior to collection
+                                # Optimization 1 (cache): if provided, reuse a precomputed background-ARI
+                                # realisation (built once per sample by `build_ari_background`) instead of
+                                # regenerating it on every HARISS call. NamedTuple with fields
+                                # (bg_df, bg_by_phl, phl_sample_targets, max_week).
+                                , precomputed_ari_bg::Union{Nothing, NamedTuple} = nothing
                                 )
     
     # Generate Gamma distribution for times between attendance/admission to hospital and swabbing, given the mode and proportion taken within 48hrs
@@ -462,6 +707,13 @@ function sample_hosp_cases_n(; p = NBPMscape.P
         phl_sample_targets[!,:est_weekly_bkg_hosp_ari_admissions_adult] = Int.( round.( hosp_ari_admissions_adult_p * phl_sample_targets.est_weekly_bkg_hosp_ari_admissions) )
         phl_sample_targets[!,:est_weekly_bkg_hosp_ari_admissions_child] = Int.( round.( hosp_ari_admissions_child_p * phl_sample_targets.est_weekly_bkg_hosp_ari_admissions) )
         # CHECK # sum(phl_sample_targets.est_weekly_bkg_hosp_ari_admissions_adult) + sum(phl_sample_targets.est_weekly_bkg_hosp_ari_admissions_child) == sum(phl_sample_targets.est_weekly_bkg_hosp_ari_admissions)
+
+        # Optimization 1 (cache): if the driver precomputed PHL allocation + background
+        # ARI for this sample (`build_ari_background`), swap its table in here. The
+        # locally-built `phl_sample_targets` above is equivalent and discarded.
+        if precomputed_ari_bg !== nothing
+            phl_sample_targets = precomputed_ari_bg.phl_sample_targets
+        end
         
         ## Determine timetable for courier collection of samples from PHLs and arrival at central testing lab
         # Courier collections twice per week - assume Monday and Thursday at midday. 
@@ -493,70 +745,23 @@ function sample_hosp_cases_n(; p = NBPMscape.P
                                 ,:verysevere => swab_time_gamma_d
                                 )
 
-        # Empty vector of DataFrames
-        ari_bkg_times_by_phl_df = DataFrame(  pid = String[]
-                                            , public_health_laboratory = String[]
-                                            , age_group = String[]
-                                            , thosp = Float64[]
-                                            , tswab = Float64[]
-                                            , ED_destination = Symbol[]
-                                           )
-        
-        for j in 1:nrow(phl_sample_targets) # j=1
-            
-            # Public Health Lab (PHL) name
-            phl_name = String(phl_sample_targets[j,:public_health_laboratory])
-            # Weekly numbers of swabs for individual PHLs
-            phl_bkg_ari_swabs_n_adult = Int( round(phl_sample_targets[j,:est_weekly_bkg_hosp_ari_admissions_adult] * proportion_hosp_swabbed , digits = 0) )
-            phl_bkg_ari_swabs_n_child = Int( round(phl_sample_targets[j,:est_weekly_bkg_hosp_ari_admissions_child] * proportion_hosp_swabbed, digits = 0 ) )
-                
-            for wn in 1:max_week # wn=13
-
-                # Create df for each PHL and DataFrames and push them
-                # Severity
-                ED_destination_adult = wsample( ed_ari_destinations_adult[:,1] , ed_ari_destinations_adult[:,2], phl_bkg_ari_swabs_n_adult) # CHECK # StatsBase.countmap(ED_destination_adult)
-                ED_destination_child = wsample( ed_ari_destinations_child[:,1] , ed_ari_destinations_child[:,2], phl_bkg_ari_swabs_n_child) # CHECK # StatsBase.countmap(ED_destination_child)
-                
-                # Simulate the time (in days) for hospital arrival, thosp = start time of week + random draw from 7 days
-                thosp_adult = ((wn-1)*7) .+ rand(phl_bkg_ari_swabs_n_adult).*7 
-                thosp_child = ((wn-1)*7) .+ rand(phl_bkg_ari_swabs_n_child).*7
-                
-                # Simulate the time (in days) that swab was taken, tswab = time of arrival in hospital + draw from Gamma distribution and dependent on length of hospital stay
-                # samples different time distributions depending on duration of stay in hospital
-                tswab_adult = thosp_adult .+ rand.(getindex.(Ref(tswab_dists_bkg), ED_destination_adult))
-                tswab_child = thosp_child .+ rand.(getindex.(Ref(tswab_dists_bkg), ED_destination_child))
-
-                # Adult
-                df_temp_adult = DataFrame( pid = String("background_ari")
-                                            , public_health_laboratory = repeat([phl_name], phl_bkg_ari_swabs_n_adult) 
-                                            , age_group = repeat(["adult"], phl_bkg_ari_swabs_n_adult)
-                                            , thosp = thosp_adult
-                                            , tswab = tswab_adult
-                                            , ED_destination = ED_destination_adult
-                                            )
-                
-                # Child
-                df_temp_child = DataFrame( pid = String("background_ari")
-                                            , public_health_laboratory = repeat([phl_name], phl_bkg_ari_swabs_n_child) 
-                                            , age_group = repeat(["child"], phl_bkg_ari_swabs_n_child)
-                                            , thosp = thosp_child
-                                            , tswab = tswab_child
-                                            , ED_destination = ED_destination_child
-                                            )
-                                
-                # Add to main df                    
-                append!(ari_bkg_times_by_phl_df, df_temp_adult)
-                append!(ari_bkg_times_by_phl_df, df_temp_child)
-            end
+        # Optimization 1 (cache) + 3 (preallocation):
+        # If a precomputed background-ARI realisation was passed in via
+        # `precomputed_ari_bg`, reuse it -- one consistent realisation per sample
+        # rather than re-rolling every HARISS call. Otherwise build it fresh
+        # with the preallocated O(N) implementation in `_build_ari_bkg_df`.
+        if precomputed_ari_bg !== nothing
+            ari_bkg_times_by_phl_df = precomputed_ari_bg.bg_df
+        else
+            ari_bkg_times_by_phl_df = _build_ari_bkg_df(
+                phl_sample_targets        = phl_sample_targets,
+                max_week                  = max_week,
+                proportion_hosp_swabbed   = proportion_hosp_swabbed,
+                ed_ari_destinations_adult = ed_ari_destinations_adult,
+                ed_ari_destinations_child = ed_ari_destinations_child,
+                tswab_dists_bkg           = tswab_dists_bkg,
+            )
         end
-            
-        # Does the swab time meet the criteria of being taken within 48h of arrival at hospital?
-        tswab_diff = (ari_bkg_times_by_phl_df.tswab .- ari_bkg_times_by_phl_df.thosp)
-        ari_bkg_times_by_phl_df.tswab_sub_48h = Bool.( tswab_diff .< (48.0/24.0) )
-        # CHECK # StatsBase.countmap(ari_bkg_times_by_phl_df.tswab_sub_48h)
-        
-        # Filter ARI background cases for those that meet 48h swab time cut-off
-        ari_bkg_times_by_phl_df = filter( row -> row.tswab_sub_48h == true, ari_bkg_times_by_phl_df ) # CHECK # StatsBase.countmap(ari_bkg_times_by_phl_df.tswab_sub_48h)
 
         ## Simulate swab times for pathogen X
 
@@ -610,19 +815,29 @@ function sample_hosp_cases_n(; p = NBPMscape.P
           return( DataFrame() )
         
         else
+          # Optimization 4: pre-group background + pathogen-X by PHL once, so the
+          # cut-off loop can do O(1) PHL lookup + a per-PHL time-window filter
+          # instead of scanning the full DataFrame twice per (cutoff × PHL).
+          bkg_by_phl   = precomputed_ari_bg !== nothing ? precomputed_ari_bg.bg_by_phl : _group_df_by_phl(ari_bkg_times_by_phl_df)
+          pathx_by_phl = _group_df_by_phl(hosp_cases_at_sampling_sites_sub48h)
+          empty_bkg    = empty(ari_bkg_times_by_phl_df)
+          empty_pathx  = empty(hosp_cases_at_sampling_sites_sub48h)
+
           # Loop through cut-off times for courier collection
             for c in 1:length(swab_time_cut_offs) # c=13
-                # Filter swabs for those meeting the required criteria and meeting the cut-off time (between the current cut-off time and previous cut-off time)
-                path_x_cases_temp = filter( row -> (row.tswab <= swab_time_cut_offs[c] && row.tswab > ( c == 1 ? 0 : swab_time_cut_offs[c-1])),  hosp_cases_at_sampling_sites_sub48h ) #path_x_cases_temp = filter( row -> (row.tswab <= swab_time_cut_offs[c] && row.tswab > swab_time_cut_offs[c-1]),  hosp_cases_at_sampling_sites_sub48h )
-                bkg_cases_temp    = filter( row -> (row.tswab <= swab_time_cut_offs[c] && row.tswab > ( c == 1 ? 0 : swab_time_cut_offs[c-1])),  ari_bkg_times_by_phl_df ) # bkg_cases_temp = filter( row -> (row.tswab <= swab_time_cut_offs[c] && row.tswab > max(try swab_time_cut_offs[c-1]),  ari_bkg_times_by_phl_df )
+                cutoff_lo = c == 1 ? 0.0 : swab_time_cut_offs[c-1]
+                cutoff_hi = swab_time_cut_offs[c]
 
                 # Loop through PHLs. Combined path_x and background cases and sort by tswab. Take the top n samples based on PHL sample targets.
                 for i in 1:nrow(phl_sample_targets) # i=1
                     phl_name = phl_sample_targets[i,:public_health_laboratory]
-                  
-                    # Filter background and pathogen X cases by PHL
-                    path_x_cases_temp_phl = filter( row -> row.public_health_laboratory == phl_name, path_x_cases_temp)
-                    bkg_cases_temp_phl    = filter( row -> row.public_health_laboratory == phl_name, bkg_cases_temp)
+
+                    # Pull this PHL's pre-grouped rows (O(1)) and apply the
+                    # time-window filter on the smaller PHL-local DF.
+                    bkg_full_phl   = get(bkg_by_phl,   String(phl_name), empty_bkg)
+                    pathx_full_phl = get(pathx_by_phl, String(phl_name), empty_pathx)
+                    path_x_cases_temp_phl = filter(row -> (row.tswab <= cutoff_hi && row.tswab > cutoff_lo), pathx_full_phl)
+                    bkg_cases_temp_phl    = filter(row -> (row.tswab <= cutoff_hi && row.tswab > cutoff_lo), bkg_full_phl)
 
                     # Select samples based on age group target
                     if sample_proportion_adult == "free"

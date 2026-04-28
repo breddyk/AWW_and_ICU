@@ -655,6 +655,10 @@ function secondary_care_td(; p = NBPMscape.P
                                                                                                                     #, proportion_of_attendances = [0.628,0.030,0.342])
                             , ed_ari_destinations_child::DataFrame = NBPMscape.P.ed_ari_destinations_child #DataFrame( destination = [:discharged,:short_stay,:longer_stay]
                                                                                                                     #, proportion_of_attendances = [0.861,0.014,0.125])
+                            # Optimization 1 (cache): optional precomputed background-ARI realisation
+                            # (built once per sample by `build_ari_background`). Passed through to
+                            # `sample_hosp_cases_n` to avoid regenerating the background on every call.
+                            , precomputed_ari_bg::Union{Nothing, NamedTuple} = nothing
                             )
 
     n_replicates = length(sims)
@@ -724,6 +728,7 @@ function secondary_care_td(; p = NBPMscape.P
                                              , proportion_hosp_swabbed = proportion_hosp_swabbed
                                              , initial_dow = initial_dow
                                              , only_sample_before_death = only_sample_before_death
+                                             , precomputed_ari_bg = precomputed_ari_bg
                                             )
 
         # Record number of cases in the sim rep and the number that were tested (record number that returned positive results below)

@@ -9,7 +9,7 @@ import UUIDs
 import StatsBase
 using Interpolations
 import SpecialFunctions as SF
-using Plots
+# using Plots
 using LinearAlgebra
 using Optim   # required by misc_functions.jl
 
@@ -18,8 +18,8 @@ using CSV
 using YAML    # required by config.jl
 
 # TODO
-using Revise
-using Debugger
+# using Revise
+# using Debugger
 
 # ── Commuting / population data ──────────────────────────────────────────────
 const COMMUTERPROBPATH   = joinpath(@__DIR__, "..", "data", "commuting_ITL2_prob_list.rds")
@@ -42,7 +42,7 @@ const HARISS_NHS_TRUST_SITES = CSV.read(HARISS_TRUST_PATH, DataFrame)
 # ── Exports ──────────────────────────────────────────────────────────────────
 export simtree, simforest, sampleforest, simgendist, Infection, infectivitytoR
 export transmissionrate, sampdegree, REGKEY, COMMUTEPROB  # TODO
-export secondary_care_td, icu_td, gp_td, courier_collection_times, sample_hosp_cases_n
+export secondary_care_td, icu_td, gp_td, courier_collection_times, sample_hosp_cases_n, build_ari_background
 export load_config, validate_config, update_configurable_parameters
 
 # ── Source files ─────────────────────────────────────────────────────────────
