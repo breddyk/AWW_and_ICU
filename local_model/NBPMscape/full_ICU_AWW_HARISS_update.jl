@@ -55,7 +55,9 @@ using CSV
 using Distributed
 using Dates
 
-addprocs(180)
+let n = haskey(ENV, "SLURM_CPUS_PER_TASK") ? parse(Int, ENV["SLURM_CPUS_PER_TASK"]) - 1 : 180
+    addprocs(n)
+end
 
 @everywhere using Pkg
 @everywhere Pkg.activate($_PROJECT_DIR)
@@ -831,9 +833,9 @@ function run_simulations_from_merged_csv(
     #     valid_combinations
     # )
 
-    # Filter to R0 = 2.0, gen time = 6.0
+    # Filter to R0 = 2.0, gen time = 4.0
     valid_combinations = filter(row -> 
-        (Float64(row.R0) == 2.0) && (Float64(row.generation_time) == 6.0),
+        (Float64(row.R0) == 2.0) && (Float64(row.generation_time) == 4.0),
         valid_combinations
     )
 
@@ -1545,14 +1547,16 @@ output_csv_path = joinpath(project_root, "global_model", "pgfgleam", "all_result
 
 results = run_simulations_from_merged_csv(
     input_csv_path;
-    num_samples = 100,
+    num_samples = 50,
     turnaround_time = 3.0,
     max_detection_time_threshold = 200.0,
     extra_time = 35.0,
     icu_sampling_proportion = 0.10,
     n_hosp_samples_per_week = Int(P_FROM_CONFIG.n_hosp_samples_per_week),
     output_path = output_csv_path,
-    batch_size = 125
+    batch_size = 40, 
+    hariss_extra_days = 21.0,
+    max_local_cases = 10000
 )
 
 println("\n✓ ICU + AWW + HARISS simulations complete!")
