@@ -1,8 +1,13 @@
 # ============================================================================
-# full_ICU_AWW_HARISS.jl
+# full_ICU_AWW_HARISS_update.jl
 #
 # Three-channel surveillance driver: ICU sampling + Airport Wastewater (AWW)
 # + HARISS (Hospital Admission Respiratory Infection Surveillance Sampling).
+#
+# Same epidemiological model as `full_ICU_AWW_HARISS.jl`, but parallelises
+# across Monte Carlo *samples* (not only countries) via `simulate_single_sample`
+# + `pmap` in `run_simulations_from_merged_csv` — see the PARALLELISATION NOTE
+# below `simulate_single_sample`.
 #
 # Mirrors `full_ICU_WW.jl` but adds HARISS as a third detection channel via
 # `NBPMscape.secondary_care_td`. Note: the `WW_*` column prefix is retained
@@ -50,7 +55,10 @@ using CSV
 using Distributed
 using Dates
 
-addprocs(180)
+let n = haskey(ENV, "SLURM_CPUS_PER_TASK") ? 
+    min(parse(Int, ENV["SLURM_CPUS_PER_TASK"]) - 1, 24) : 24
+addprocs(n)
+end
 
 @everywhere using Pkg
 @everywhere Pkg.activate($_PROJECT_DIR)
@@ -71,11 +79,20 @@ addprocs(180)
 
 # Path to the YAML config -- relative to the NBPMscape package root so it
 # resolves the same way on every worker regardless of CWD.
-@everywhere const CONFIG_REL_PATH = "config/outbreak_params_covid19_like.yaml"
+@everywhere const CONFIG_REL_PATH = "config/outbreak_params_influenza_like.yaml"
 
 @everywhere const CONFIG_ABS_PATH = joinpath(pkgdir(NBPMscape), CONFIG_REL_PATH)
 
 @everywhere const CONFIG_DATA = NBPMscape.load_config(CONFIG_ABS_PATH)
+
+
+# Correct calibrated values from inftoR.jl
+@everywhere const INFECTIVITY_FOR_R0_INFLUENZA = Dict(
+    1.5 => 10.813340,
+    2.0 => 14.417787,
+    2.5 => 18.022233,
+    3.0 => 21.626680,
+)
 
 # Map a YAML config Dict onto a parameter NamedTuple by overwriting only the
 # scalar/vector keys that already exist in `P`. Mirrors the conversions done
@@ -210,85 +227,280 @@ end
     return daily_imports, total_imports
 end
 
+
 # ============================================================================
 # COMBINED ICU + WW DETECTION WITH SPLIT IMPORT TYPES
 # ============================================================================
+#
+# PARALLELISATION NOTE
+# --------------------
+# Each Monte-Carlo sample is independent, so we expose the per-sample work via
+# `simulate_single_sample` and let the top-level `pmap` in
+# `run_simulations_from_merged_csv` dispatch (combination × sample) tuples.
+# This means big-population countries (Brazil/USA/...) no longer block a whole
+# worker serially on 100 samples -- their samples are spread across all
+# workers, dramatically improving tail latency. `simulate_country_detection`
+# is kept as a thin serial wrapper for back-compat / direct calls.
 
-@everywhere function simulate_country_detection(
+@everywhere function simulate_single_sample(
     country_data::DataFrame,
     country_name::String,
-    num_samples::Int,
+    sample_id::Int,
     R0::Float64,
     mean_generation_time::Float64,
     icu_sampling_proportion::Float64,
     airport_detection_probs::Vector{Float64},
-    max_observation_time::Float64;
-    mean_infectious_period = 8/3,
+    max_observation_time::Float64,
+    hariss_bg_cache;
+    mean_infectious_period = 0.99,  # 8/3 days, Verity et al (2020). If influenza, 0.99, Cori et al (2012), mean of Gamma(1.04, 0.946)
     turnaround_time::Float64 = 3.0,
     n_hosp_samples_per_week::Int = Int(P_FROM_CONFIG.n_hosp_samples_per_week),
-    verbose::Bool = true
+    hariss_extra_days::Float64 = 14.0,
+    max_cases::Int = 1000
 )
-    """
-    Simulate ICU + AWW + HARISS detection with CORRECT import types
-
-    KEY:
-    - Seeding local transmission uses:
-      * daily_latent_imports (L) - starts from latent period (normal seeding)
-      * daily_infectious_imports (I) - starts immediately infectious (no latent period)
-    - Airport (AWW) detection uses daily_detectable_imports (I + P)
-    - HARISS detection samples hospital admissions from the locally simulated
-      outbreak via NBPMscape.secondary_care_td.
-    """
-
-    if verbose
-        println("  Processing $country_name (R0=$R0, gen_time=$mean_generation_time)")
-        println("    Max observation time: $max_observation_time days")
-        println("    ICU sampling: $(icu_sampling_proportion*100)%")
-        println("    AWW detection probs: $(airport_detection_probs)")
-        println("    HARISS samples/week: $(n_hosp_samples_per_week)")
-    end
-    
-    # --- FIXED INFECTIOUS PERIOD ---
     infectious_period = mean_infectious_period
     latent_period = mean_generation_time - (0.5 * infectious_period)
-    
-    if latent_period < 0
-        error("Invalid parameters: latent_period < 0 for gen_time=$mean_generation_time")
-    end
-    
-    if verbose
-        println("    Latent period: $(round(latent_period, digits=2))d")
-        println("    Infectious period: $(round(infectious_period, digits=2))d (fixed)")
-    end
-    
-    # --- DETERMINISTIC PERIODS ---
-    fixed_shape = 1000.0
-    latent_scale = latent_period / fixed_shape
-    infectious_scale = infectious_period / fixed_shape
+    latent_period < 0 && error("Invalid parameters: latent_period < 0 for gen_time=$mean_generation_time")
 
-    # --- SCALE INFECTIVITY ---
-    # Use the YAML-loaded baseline parameters (P_FROM_CONFIG) so all rate /
-    # severity / sampling settings reflect the active config, not the
-    # package-bundled defaults in NBPMscape.P.
-    baseline_R0 = 2.03
-    infectivity_scaling = (R0 / baseline_R0) * P_FROM_CONFIG.infectivity
+    fixed_shape = 1000.0
+
+    infectivity_scaling = INFECTIVITY_FOR_R0_INFLUENZA[R0]
 
     base_params = merge(P_FROM_CONFIG, (
-        infectivity = infectivity_scaling,
-        latent_scale = latent_scale,
-        infectious_scale = infectious_scale,
+        infectivity      = infectivity_scaling,
+        latent_scale     = latent_period / fixed_shape,
+        infectious_scale = infectious_period / fixed_shape,
         infectious_shape = fixed_shape,
-        latent_shape = fixed_shape,
-        importrate = 0.0,
-        turnaroundtime = turnaround_time
+        latent_shape     = fixed_shape,
+        importrate       = 0.0,
+        turnaroundtime   = turnaround_time,
+    ))
+    icu_params        = merge(base_params, (p_sampled_icu = icu_sampling_proportion,))
+    infectious_params = merge(base_params, (
+        latent_scale     = 1e-6,
+        infectious_scale = (infectious_period / 2.0) / fixed_shape,
+        latent_shape     = fixed_shape,
     ))
 
-    icu_params = merge(base_params, (psampled = icu_sampling_proportion,))
-    
-    # Storage for results
+    latent_import_counts,     total_latent     = sample_daily_imports_poisson(country_data, sample_id, :daily_latent_imports)
+    infectious_import_counts, total_infectious = sample_daily_imports_poisson(country_data, sample_id, :daily_infectious_imports)
+    detectable_import_counts, total_detectable = sample_daily_imports_poisson(country_data, sample_id, :daily_detectable_imports)
+
+    local_tinf        = Float64[]
+    icu_ticu          = Float64[]
+    icu_trecovered    = Float64[]
+    hariss_pid        = String[]
+    hariss_tinf       = Float64[]
+    hariss_tgp        = Float64[]
+    hariss_ted        = Float64[]
+    hariss_thospital  = Float64[]
+    hariss_ticu       = Float64[]
+    hariss_trecovered = Float64[]
+    hariss_tdeceased  = Float64[]
+    hariss_severity   = Symbol[]
+    hariss_iscommuter = Bool[]
+    hariss_homeregion = String[]
+    hariss_simid      = String[]
+    hariss_tstepdown     = Float64[]
+    hariss_tdischarge    = Float64[]
+    hariss_fatal         = Bool[]
+    hariss_infectee_age  = Int8[]
+    hariss_importedinf   = Bool[]
+
+    airport_detected   = Dict{Float64, Bool}(p => false for p in airport_detection_probs)
+    first_airport_time = Dict{Float64, Float64}(p => Inf for p in airport_detection_probs)
+
+    # ── Main per-day loop ─────────────────────────────────────────────────────
+    # sampleforest (ICU) and secondary_care_td (HARISS) are both called once
+    # after this loop. The tree runs to max_observation_time unconditionally,
+    # replacing the old hariss_extra_stop_time grace window which required
+    # knowing the ICU detection time mid-loop.
+    # max_observation_time already includes extra_time from the caller so both
+    # ICU and HARISS see the same epidemic window as before.
+    for (idx, row) in enumerate(eachrow(country_data))
+        time = row.time
+        time >= max_observation_time && break
+
+        # Airport detection
+        daily_detectable = detectable_import_counts[idx]
+        if daily_detectable > 0
+            for p_det in airport_detection_probs
+                if !airport_detected[p_det]
+                    if rand() < 1.0 - (1.0 - p_det)^daily_detectable
+                        airport_detected[p_det]   = true
+                        first_airport_time[p_det] = time + turnaround_time
+                    end
+                end
+            end
+        end
+
+        # Tree growth
+        for (import_counts, params, t0_offset) in (
+                (latent_import_counts,     base_params,       -latent_period / 2.0),
+                (infectious_import_counts, infectious_params,  0.0),
+            )
+            n = import_counts[idx]
+            n == 0 && continue
+            t0 = Float64(time) + t0_offset
+            for _ in 1:n
+                results = NBPMscape.simtree(params,
+                    initialtime    = t0,
+                    maxtime        = max_observation_time,
+                    maxgenerations = 100,
+                    initialcontact = :G,
+                    max_cases = max_cases
+                )
+                G = results.G
+                nrow(G) == 0 && continue
+                for gr in eachrow(G)
+                    gr.generation == 0 && continue
+                    push!(local_tinf, gr.tinf)
+                    if isfinite(gr.ticu)
+                        push!(icu_ticu,       gr.ticu)
+                        push!(icu_trecovered, gr.trecovered)
+                    end
+                    if isfinite(gr.ted) || isfinite(gr.thospital)
+                        push!(hariss_pid,        gr.pid)
+                        push!(hariss_tinf,       gr.tinf)
+                        push!(hariss_tgp,        gr.tgp)
+                        push!(hariss_ted,        gr.ted)
+                        push!(hariss_thospital,  gr.thospital)
+                        push!(hariss_ticu,       gr.ticu)
+                        push!(hariss_trecovered, gr.trecovered)
+                        push!(hariss_tdeceased,  gr.tdeceased)
+                        push!(hariss_severity,   gr.severity)
+                        push!(hariss_iscommuter, gr.iscommuter)
+                        push!(hariss_homeregion, gr.homeregion)
+                        push!(hariss_simid,      gr.simid)
+                        push!(hariss_tdischarge,   gr.tdischarge)
+                        push!(hariss_tstepdown,    gr.tstepdown)
+                        push!(hariss_fatal,        gr.fatal)
+                        push!(hariss_infectee_age, gr.infectee_age)
+                        push!(hariss_importedinf,  gr.importedinfection)
+                    end
+                end
+            end
+        end
+    end
+
+    # ── Single post-loop ICU check ────────────────────────────────────────────
+    icu_detected   = false
+    first_icu_time = Inf
+    if !isempty(icu_ticu)
+        icu_fo      = (G = DataFrame(ticu = icu_ticu, trecovered = icu_trecovered),)
+        icu_sampled = NBPMscape.sampleforest(icu_fo, icu_params)
+        if !isempty(icu_sampled.treport)
+            icu_detected   = true
+            first_icu_time = minimum(icu_sampled.treport)
+        end
+    end
+
+    # ── Single post-loop HARISS check ────────────────────────────────────────
+    hariss_detected   = false
+    first_hariss_time = Inf
+    if !isempty(hariss_pid) && hariss_bg_cache !== nothing
+        hariss_df = DataFrame(
+            pid               = hariss_pid,
+            tinf              = hariss_tinf,
+            tgp               = hariss_tgp,
+            ted               = hariss_ted,
+            thospital         = hariss_thospital,
+            ticu              = hariss_ticu,
+            tstepdown         = hariss_tstepdown,
+            tdischarge        = hariss_tdischarge,
+            trecovered        = hariss_trecovered,
+            tdeceased         = hariss_tdeceased,
+            severity          = hariss_severity,
+            fatal             = hariss_fatal,
+            iscommuter        = hariss_iscommuter,
+            homeregion        = hariss_homeregion,
+            simid             = hariss_simid,
+            infectee_age      = hariss_infectee_age,
+            importedinfection = hariss_importedinf,
+        )
+        try
+            hariss_result = redirect_stdout(devnull) do
+                NBPMscape.secondary_care_td(;
+                    p                                = base_params,
+                    sims                             = [hariss_df],
+                    pathogen_type                    = P_FROM_CONFIG.pathogen_type,
+                    initial_dow                      = P_FROM_CONFIG.initial_dow,
+                    hariss_courier_to_analysis       = P_FROM_CONFIG.hariss_courier_to_analysis,
+                    hariss_turnaround_time           = [turnaround_time, turnaround_time + 1e-6],
+                    n_hosp_samples_per_week          = n_hosp_samples_per_week,
+                    sample_allocation                = P_FROM_CONFIG.sample_allocation,
+                    sample_proportion_adult          = P_FROM_CONFIG.sample_proportion_adult,
+                    hariss_nhs_trust_sampling_sites  = HARISS_SITES_FROM_CONFIG,
+                    weight_samples_by                = P_FROM_CONFIG.weight_samples_by,
+                    phl_collection_dow               = Vector{Int64}(P_FROM_CONFIG.phl_collection_dow),
+                    phl_collection_time              = Float64(P_FROM_CONFIG.phl_collection_time),
+                    hosp_to_phl_cutoff_time_relative = P_FROM_CONFIG.hosp_to_phl_cutoff_time_relative,
+                    swab_time_mode                   = P_FROM_CONFIG.swab_time_mode,
+                    swab_proportion_at_48h           = P_FROM_CONFIG.swab_proportion_at_48h,
+                    proportion_hosp_swabbed          = P_FROM_CONFIG.proportion_hosp_swabbed,
+                    only_sample_before_death         = P_FROM_CONFIG.hariss_only_sample_before_death,
+                    ed_discharge_limit               = Float64(P_FROM_CONFIG.tdischarge_ed_upper_limit),
+                    hosp_short_stay_limit            = Float64(P_FROM_CONFIG.tdischarge_hosp_short_stay_upper_limit),
+                    hosp_ari_admissions              = Int(P_FROM_CONFIG.hosp_ari_admissions),
+                    hosp_ari_admissions_adult_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
+                    hosp_ari_admissions_child_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
+                    ed_ari_destinations_adult        = P_FROM_CONFIG.ed_ari_destinations_adult,
+                    ed_ari_destinations_child        = P_FROM_CONFIG.ed_ari_destinations_child,
+                    precomputed_ari_bg               = hariss_bg_cache,
+                )
+            end
+            if nrow(hariss_result) > 0 && :SC_TD in propertynames(hariss_result)
+                sc_finite = filter(x -> !ismissing(x) && isfinite(x), hariss_result.SC_TD)
+                if !isempty(sc_finite)
+                    td_min = minimum(sc_finite)
+                    if td_min <= max_observation_time
+                        hariss_detected   = true
+                        first_hariss_time = td_min
+                    end
+                end
+            end
+        catch hariss_err
+            @warn "HARISS sampling failed" country=country_name sample=sample_id err=hariss_err
+        end
+    end
+
+    # ── Local case counts at detection ───────────────────────────────────────
+    icu_local_cases    = (icu_detected    && isfinite(first_icu_time))    ? Float64(count(<=(first_icu_time),    local_tinf)) : NaN
+    hariss_local_cases = (hariss_detected && isfinite(first_hariss_time)) ? Float64(count(<=(first_hariss_time), local_tinf)) : NaN
+
+    airport_local_cases = Dict{Float64, Float64}()
+    for p_det in airport_detection_probs
+        airport_local_cases[p_det] = (airport_detected[p_det] && isfinite(first_airport_time[p_det])) ?
+            Float64(count(<=(first_airport_time[p_det]), local_tinf)) : NaN
+    end
+
+    return (
+        sample_id             = sample_id,
+        icu_detected          = icu_detected,
+        icu_detection_time    = first_icu_time,
+        icu_local_cases       = icu_local_cases,
+        hariss_detected       = hariss_detected,
+        hariss_detection_time = first_hariss_time,
+        hariss_local_cases    = hariss_local_cases,
+        airport_detected      = airport_detected,
+        airport_detection_times = first_airport_time,
+        airport_local_cases   = airport_local_cases,
+        total_latent          = Float64(total_latent),
+        total_infectious      = Float64(total_infectious),
+        total_detectable      = Float64(total_detectable),
+    )
+end
+
+@everywhere function aggregate_sample_results(
+    sample_results::AbstractVector,
+    airport_detection_probs::Vector{Float64}
+)
+    """
+    Combine a vector of `simulate_single_sample` outputs into the same
+    NamedTuple that `simulate_country_detection` historically returned.
+    """
     icu_detection_times = Float64[]
     icu_local_cases_at_detection = Float64[]
-
     hariss_detection_times = Float64[]
     hariss_local_cases_at_detection = Float64[]
 
@@ -300,312 +512,36 @@ end
             :total_detections => 0
         )
     end
-    
-    latent_imports_per_sample = Float64[]
-    infectious_imports_per_sample = Float64[]
-    detectable_imports_per_sample = Float64[]
-    
-    for sample in 1:num_samples
-        if verbose && (sample % 10 == 0 || sample == 1)
-            println("    Sample $sample/$num_samples")
-            flush(stdout)
-        end
-        
-        # ========================================
-        # KEY CHANGE: Sample THREE different import types
-        # ========================================
-        
-        # 1. Latent imports (L) - seeds local transmission, starts from latent period
-        latent_import_counts, total_latent = sample_daily_imports_poisson(
-            country_data, sample, :daily_latent_imports
-        )
-        
-        # 2. Infectious imports (I) - seeds local transmission, starts immediately infectious
-        infectious_import_counts, total_infectious = sample_daily_imports_poisson(
-            country_data, sample, :daily_infectious_imports
-        )
-        
-        push!(latent_imports_per_sample, total_latent)
-        push!(infectious_imports_per_sample, total_infectious)
-        
-        # 3. Detectable imports (I + P) - can trigger airport detection
-        detectable_import_counts, total_detectable = sample_daily_imports_poisson(
-            country_data, sample, :daily_detectable_imports
-        )
-        push!(detectable_imports_per_sample, total_detectable)
-        
-        # Track state for this sample
-        sample_infections = DataFrame()
-        icu_detected_this_sample = false
-        first_icu_detection_time = Inf
-        hariss_detected_this_sample = false
-        first_hariss_detection_time = Inf
-        # HARISS is now a single end-of-sample check (see block after the
-        # per-day loop), so no weekly-throttle bookkeeping is needed.
 
-        # ── HARISS background-ARI cache (fix 1: one realisation per sample) ──
-        # Previously `secondary_care_td` re-rolled the full background-ARI
-        # hospital population on every weekly HARISS call within this sample,
-        # treating each check as an independent draw. That biased detections
-        # earlier (many lotteries) and inflated variance. We now build a single
-        # cached realisation covering the full observation window and pass it
-        # to every HARISS call in this sample, so the background world stays
-        # consistent across checks -- matching physical reality. ICU / AWW
-        # are unaffected.
-        hariss_bg_cache = NBPMscape.build_ari_background(;
-            max_observation_time            = Float64(max_observation_time),
-            n_hosp_samples_per_week         = n_hosp_samples_per_week,
-            sample_allocation               = P_FROM_CONFIG.sample_allocation,
-            sample_proportion_adult         = P_FROM_CONFIG.sample_proportion_adult,
-            hariss_nhs_trust_sampling_sites = HARISS_SITES_FROM_CONFIG,
-            weight_samples_by               = P_FROM_CONFIG.weight_samples_by,
-            swab_time_mode                  = P_FROM_CONFIG.swab_time_mode,
-            swab_proportion_at_48h          = P_FROM_CONFIG.swab_proportion_at_48h,
-            proportion_hosp_swabbed         = P_FROM_CONFIG.proportion_hosp_swabbed,
-            ed_discharge_limit              = Float64(P_FROM_CONFIG.tdischarge_ed_upper_limit),
-            hosp_short_stay_limit           = Float64(P_FROM_CONFIG.tdischarge_hosp_short_stay_upper_limit),
-            hosp_ari_admissions             = Int(P_FROM_CONFIG.hosp_ari_admissions),
-            hosp_ari_admissions_adult_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
-            hosp_ari_admissions_child_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
-            ed_ari_destinations_adult       = P_FROM_CONFIG.ed_ari_destinations_adult,
-            ed_ari_destinations_child       = P_FROM_CONFIG.ed_ari_destinations_child,
-        )
-        
-        # Track WW detection for each p_det
-        airport_detected = Dict{Float64, Bool}()
-        first_airport_detection_time = Dict{Float64, Float64}()
+    latent_imports = Float64[]
+    infectious_imports = Float64[]
+    detectable_imports = Float64[]
+
+    for r in sample_results
+        push!(latent_imports, r.total_latent)
+        push!(infectious_imports, r.total_infectious)
+        push!(detectable_imports, r.total_detectable)
+
+        if r.icu_detected && isfinite(r.icu_detection_time) && !isnan(r.icu_local_cases)
+            push!(icu_detection_times, r.icu_detection_time)
+            push!(icu_local_cases_at_detection, r.icu_local_cases)
+        end
+        if r.hariss_detected && isfinite(r.hariss_detection_time) && !isnan(r.hariss_local_cases)
+            push!(hariss_detection_times, r.hariss_detection_time)
+            push!(hariss_local_cases_at_detection, r.hariss_local_cases)
+        end
         for p_det in airport_detection_probs
-            airport_detected[p_det] = false
-            first_airport_detection_time[p_det] = Inf
-        end
-        
-        # Process imports chronologically
-        for (idx, row) in enumerate(eachrow(country_data))
-            time = row.time
-            if time >= max_observation_time
-                break
-            end
-            
-            # ========================================
-            # AIRPORT DETECTION: Uses detectable imports (I + P)
-            # ========================================
-            daily_detectable_count = detectable_import_counts[idx]
-            
-            if daily_detectable_count > 0
-                for p_det in airport_detection_probs
-                    if !airport_detected[p_det]
-                        prob_detection_today = 1.0 - (1.0 - p_det)^daily_detectable_count
-                        
-                        if rand() < prob_detection_today
-                            airport_detected[p_det] = true
-                            first_airport_detection_time[p_det] = time + turnaround_time
-                            airport_results[p_det][:total_detections] += 1
-                        end
-                    end
-                end
-            end
-            
-            # ========================================
-            # LOCAL TRANSMISSION: Seeds from latent (L) and infectious (I) imports
-            # ========================================
-            daily_latent_count = latent_import_counts[idx]
-            daily_infectious_count = infectious_import_counts[idx]
-            
-            # Process latent imports (L) - normal seeding (starts from midpoint of latent period)
-            for j in 1:daily_latent_count
-                results = NBPMscape.simtree(base_params,
-                    initialtime = Float64(time) - latent_period / 2.0,
-                    maxtime = max_observation_time,
-                    maxgenerations = 100,
-                    initialcontact = :G
-                )
-                
-                if nrow(results.G) > 0
-                    results.G[1, :generation] = 0
-                    results.G.import_event .= Int(time)
-                    results.G.import_time .= Float64(time)
-                    
-                    if isempty(sample_infections)
-                        sample_infections = results.G
-                    else
-                        append!(sample_infections, results.G)
-                    end
-                end
-            end
-            
-            # Process infectious imports (I) - start immediately infectious, and midway through (no latent period)
-            # Use modified parameters with essentially zero latent period
-            # Set latent_scale to very small value so laglatent ≈ 0, making tinfectious ≈ tinf
-            infectious_params = merge(base_params, (
-                latent_scale = 1e-6,
-                infectious_scale = (infectious_period / 2.0) / fixed_shape,  # Half infectious period remaining
-                latent_shape = fixed_shape
-            ))
-            
-            for j in 1:daily_infectious_count
-                # Start at arrival time, not before
-                results = NBPMscape.simtree(infectious_params,
-                    initialtime = Float64(time),
-                    maxtime = max_observation_time,
-                    maxgenerations = 100,
-                    initialcontact = :G
-                )
-                
-                if nrow(results.G) > 0
-                    results.G[1, :generation] = 0
-                    results.G.import_event .= Int(time)
-                    results.G.import_time .= Float64(time)
-                    # With very small latent_scale, tinfectious ≈ tinf (immediately infectious)
-                    # and tfin ≈ tinf + lagrecovery (no latent period in total duration)
-                    
-                    if isempty(sample_infections)
-                        sample_infections = results.G
-                    else
-                        append!(sample_infections, results.G)
-                    end
-                end
-            end
-            
-            # Check ICU detection after processing this day's imports
-            if !icu_detected_this_sample && !isempty(sample_infections)
-                icu_sampled = NBPMscape.sampleforest(
-                    (G = sample_infections,),
-                    icu_params
-                )
-
-                if !isempty(icu_sampled.treport)
-                    icu_detected_this_sample = true
-                    first_icu_detection_time = minimum(icu_sampled.treport)
-                end
-            end
-
-            # HARISS is NOT checked inside the per-day loop -- see the single
-            # terminal call after this loop. HARISS detection cannot influence
-            # transmission, and running it weekly means re-processing the
-            # whole trajectory each call (the dominant cost per sample). A
-            # single end-of-sample call gives min(treport), which is
-            # mathematically identical to the first weekly check that would
-            # have fired (each weekly snapshot is a prefix of the final
-            # trajectory, so its min(treport) >= final min(treport)).
-
-            # EARLY STOPPING — ICU + every AWW arm. HARISS is resolved after
-            # the loop, so it no longer gates early exit here. The per-day
-            # loop is cheap (Poisson import draws + bounded simtree calls),
-            # so running until ICU + AWW have fired is dominated by the
-            # simtree cost we were already paying.
-            all_airport_detected = all(airport_detected[p] for p in airport_detection_probs)
-            if icu_detected_this_sample && all_airport_detected
-                if verbose && sample <= 3
-                    println("    Early stop at day $time: ICU + all AWW detected")
-                end
-                break
-            end
-        end
-
-        # ── Single end-of-sample HARISS check ──
-        # Equivalent to weekly checks for detection-time purposes. Weekly
-        # version re-drew HARISS randomness each call; here we draw once per
-        # case, matching how ICU / AWW are treated.
-        if !hariss_detected_this_sample && !isempty(sample_infections)
-            try
-                sims_for_hariss = sample_infections
-                if !(:simid in propertynames(sims_for_hariss))
-                    sims_for_hariss = copy(sample_infections)
-                    sims_for_hariss.simid .= "sim-$(sample)"
-                end
-
-                hariss_result = redirect_stdout(devnull) do
-                    NBPMscape.secondary_care_td(;
-                        p = base_params,
-                        sims = [sims_for_hariss],
-                        pathogen_type                    = P_FROM_CONFIG.pathogen_type,
-                        initial_dow                      = P_FROM_CONFIG.initial_dow,
-                        hariss_courier_to_analysis       = P_FROM_CONFIG.hariss_courier_to_analysis,
-                        hariss_turnaround_time           = [turnaround_time, turnaround_time + 1e-6],
-                        n_hosp_samples_per_week          = n_hosp_samples_per_week,
-                        sample_allocation                = P_FROM_CONFIG.sample_allocation,
-                        sample_proportion_adult          = P_FROM_CONFIG.sample_proportion_adult,
-                        hariss_nhs_trust_sampling_sites  = HARISS_SITES_FROM_CONFIG,
-                        weight_samples_by                = P_FROM_CONFIG.weight_samples_by,
-                        phl_collection_dow               = Vector{Int64}(P_FROM_CONFIG.phl_collection_dow),
-                        phl_collection_time              = Float64(P_FROM_CONFIG.phl_collection_time),
-                        hosp_to_phl_cutoff_time_relative = P_FROM_CONFIG.hosp_to_phl_cutoff_time_relative,
-                        swab_time_mode                   = P_FROM_CONFIG.swab_time_mode,
-                        swab_proportion_at_48h           = P_FROM_CONFIG.swab_proportion_at_48h,
-                        proportion_hosp_swabbed          = P_FROM_CONFIG.proportion_hosp_swabbed,
-                        only_sample_before_death         = P_FROM_CONFIG.hariss_only_sample_before_death,
-                        ed_discharge_limit               = Float64(P_FROM_CONFIG.tdischarge_ed_upper_limit),
-                        hosp_short_stay_limit            = Float64(P_FROM_CONFIG.tdischarge_hosp_short_stay_upper_limit),
-                        hosp_ari_admissions              = Int(P_FROM_CONFIG.hosp_ari_admissions),
-                        hosp_ari_admissions_adult_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
-                        hosp_ari_admissions_child_p      = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
-                        ed_ari_destinations_adult        = P_FROM_CONFIG.ed_ari_destinations_adult,
-                        ed_ari_destinations_child        = P_FROM_CONFIG.ed_ari_destinations_child,
-                        precomputed_ari_bg               = hariss_bg_cache,
-                    )
-                end
-
-                if nrow(hariss_result) > 0 && :SC_TD in propertynames(hariss_result)
-                    sc_td_finite = filter(x -> !ismissing(x) && isfinite(x), hariss_result.SC_TD)
-                    if !isempty(sc_td_finite)
-                        td_min = minimum(sc_td_finite)
-                        if td_min <= max_observation_time
-                            hariss_detected_this_sample = true
-                            first_hariss_detection_time = td_min
-                        end
-                    end
-                end
-            catch hariss_err
-                @warn "HARISS sampling failed" country=country_name sample=sample err=hariss_err
-            end
-        end
-        
-        # Record detections
-        if !isempty(sample_infections)
-            # ICU detection
-            if icu_detected_this_sample && isfinite(first_icu_detection_time)
-                push!(icu_detection_times, first_icu_detection_time)
-
-                icu_local_cases = sum((sample_infections.generation .> 0) .&
-                                     (sample_infections.tinf .<= first_icu_detection_time))
-                push!(icu_local_cases_at_detection, icu_local_cases)
-            end
-
-            # HARISS detection
-            if hariss_detected_this_sample && isfinite(first_hariss_detection_time)
-                push!(hariss_detection_times, first_hariss_detection_time)
-
-                hariss_local_cases = sum((sample_infections.generation .> 0) .&
-                                         (sample_infections.tinf .<= first_hariss_detection_time))
-                push!(hariss_local_cases_at_detection, hariss_local_cases)
-            end
-
-            # Airport/WW detection for each p_det
-            for p_det in airport_detection_probs
-                if airport_detected[p_det] && isfinite(first_airport_detection_time[p_det])
-                    push!(airport_results[p_det][:detection_times], first_airport_detection_time[p_det])
-                    
-                    airport_local_cases = sum((sample_infections.generation .> 0) .& 
-                                             (sample_infections.tinf .<= first_airport_detection_time[p_det]))
-                    push!(airport_results[p_det][:local_cases_at_detection], airport_local_cases)
+            if r.airport_detected[p_det] && isfinite(r.airport_detection_times[p_det])
+                airport_results[p_det][:total_detections] += 1
+                push!(airport_results[p_det][:detection_times], r.airport_detection_times[p_det])
+                if !isnan(r.airport_local_cases[p_det])
+                    push!(airport_results[p_det][:local_cases_at_detection], r.airport_local_cases[p_det])
                 end
             end
         end
     end
-    
-    if verbose
-        for p_det in airport_detection_probs
-            airport_pct = round(100*airport_results[p_det][:total_detections]/num_samples, digits=1)
-            println("    p_det=$p_det: AWW=$airport_pct% detected")
-        end
-        icu_pct = round(100*length(icu_detection_times)/num_samples, digits=1)
-        println("    ICU=$icu_pct% detected")
-        hariss_pct = round(100*length(hariss_detection_times)/num_samples, digits=1)
-        println("    HARISS=$hariss_pct% detected")
-        println("    Mean latent imports/sample: $(round(mean(latent_imports_per_sample), digits=2))")
-        println("    Mean infectious imports/sample: $(round(mean(infectious_imports_per_sample), digits=2))")
-        println("    Mean detectable imports/sample: $(round(mean(detectable_imports_per_sample), digits=2))")
-    end
+
+    mean_or_nan(v) = isempty(v) ? NaN : mean(v)
 
     return (
         icu_detection_times = icu_detection_times,
@@ -613,10 +549,89 @@ end
         hariss_detection_times = hariss_detection_times,
         hariss_local_cases_at_detection = hariss_local_cases_at_detection,
         airport_results = airport_results,
-        mean_latent_imports_per_sample = mean(latent_imports_per_sample),
-        mean_infectious_imports_per_sample = mean(infectious_imports_per_sample),
-        mean_detectable_imports_per_sample = mean(detectable_imports_per_sample)
+        mean_latent_imports_per_sample = mean_or_nan(latent_imports),
+        mean_infectious_imports_per_sample = mean_or_nan(infectious_imports),
+        mean_detectable_imports_per_sample = mean_or_nan(detectable_imports)
     )
+end
+
+# Back-compat wrapper: serial loop over samples. Prefer calling
+# `simulate_single_sample` directly (e.g. from pmap) for parallelism.
+@everywhere function simulate_country_detection(
+    country_data::DataFrame,
+    country_name::String,
+    num_samples::Int,
+    R0::Float64,
+    mean_generation_time::Float64,
+    icu_sampling_proportion::Float64,
+    airport_detection_probs::Vector{Float64},
+    max_observation_time::Float64;
+    mean_infectious_period = 0.99, # 8/3 days, Verity et al (2020). If influenza, 0.99, Cori et al (2012), mean of Gamma(1.04, 0.946)
+    turnaround_time::Float64 = 3.0,
+    n_hosp_samples_per_week::Int = Int(P_FROM_CONFIG.n_hosp_samples_per_week),
+    hariss_extra_days::Float64 = 14.0,
+    verbose::Bool = true
+)
+    if verbose
+        println("  Processing $country_name (R0=$R0, gen_time=$mean_generation_time)")
+        println("    Max observation time: $max_observation_time days")
+        println("    ICU sampling: $(icu_sampling_proportion*100)%")
+        println("    AWW detection probs: $(airport_detection_probs)")
+        println("    HARISS samples/week: $(n_hosp_samples_per_week)")
+    end
+
+    hariss_bg_cache = NBPMscape.build_ari_background(;
+        max_observation_time            = Float64(max_observation_time),
+        n_hosp_samples_per_week         = n_hosp_samples_per_week,
+        sample_allocation               = P_FROM_CONFIG.sample_allocation,
+        sample_proportion_adult         = P_FROM_CONFIG.sample_proportion_adult,
+        hariss_nhs_trust_sampling_sites = HARISS_SITES_FROM_CONFIG,
+        weight_samples_by               = P_FROM_CONFIG.weight_samples_by,
+        swab_time_mode                  = P_FROM_CONFIG.swab_time_mode,
+        swab_proportion_at_48h          = P_FROM_CONFIG.swab_proportion_at_48h,
+        proportion_hosp_swabbed         = P_FROM_CONFIG.proportion_hosp_swabbed,
+        ed_discharge_limit              = Float64(P_FROM_CONFIG.tdischarge_ed_upper_limit),
+        hosp_short_stay_limit           = Float64(P_FROM_CONFIG.tdischarge_hosp_short_stay_upper_limit),
+        hosp_ari_admissions             = Int(P_FROM_CONFIG.hosp_ari_admissions),
+        hosp_ari_admissions_adult_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
+        hosp_ari_admissions_child_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
+        ed_ari_destinations_adult       = P_FROM_CONFIG.ed_ari_destinations_adult,
+        ed_ari_destinations_child       = P_FROM_CONFIG.ed_ari_destinations_child,
+    )
+
+    sample_results = Vector{Any}(undef, num_samples)
+    for sample in 1:num_samples
+        if verbose && (sample % 10 == 0 || sample == 1)
+            println("    Sample $sample/$num_samples")
+            flush(stdout)
+        end
+        sample_results[sample] = simulate_single_sample(
+            country_data, country_name, sample,
+            R0, mean_generation_time, icu_sampling_proportion,
+            airport_detection_probs, max_observation_time,
+            hariss_bg_cache;
+            mean_infectious_period = mean_infectious_period,
+            turnaround_time = turnaround_time,
+            n_hosp_samples_per_week = n_hosp_samples_per_week,
+            hariss_extra_days = hariss_extra_days
+        )
+    end
+
+    agg = aggregate_sample_results(sample_results, airport_detection_probs)
+
+    if verbose
+        for p_det in airport_detection_probs
+            airport_pct = round(100*agg.airport_results[p_det][:total_detections]/num_samples, digits=1)
+            println("    p_det=$p_det: AWW=$airport_pct% detected")
+        end
+        println("    ICU=$(round(100*length(agg.icu_detection_times)/num_samples, digits=1))% detected")
+        println("    HARISS=$(round(100*length(agg.hariss_detection_times)/num_samples, digits=1))% detected")
+        println("    Mean latent imports/sample: $(round(agg.mean_latent_imports_per_sample, digits=2))")
+        println("    Mean infectious imports/sample: $(round(agg.mean_infectious_imports_per_sample, digits=2))")
+        println("    Mean detectable imports/sample: $(round(agg.mean_detectable_imports_per_sample, digits=2))")
+    end
+
+    return agg
 end
 
 # ============================================================================
@@ -699,7 +714,9 @@ function run_simulations_from_merged_csv(
     icu_sampling_proportion::Float64 = 0.10,
     n_hosp_samples_per_week::Int = Int(P_FROM_CONFIG.n_hosp_samples_per_week),
     output_path::String = "results_aww_icu_hariss.csv",
-    batch_size::Int = 125
+    batch_size::Int = 125,
+    hariss_extra_days::Float64 = 14.0,
+    max_cases::Int = 1000
 )
     """
     Run AWW + ICU + HARISS simulations.
@@ -775,51 +792,28 @@ function run_simulations_from_merged_csv(
         param_combinations
     )
 
-    # # # Restrict to a specific whitelist of countries
-    # allowed_countries = Set(["Paraguay", "Ghana", "Switzerland"])
-    # valid_combinations = filter(row ->
-    #     row.outbreak_country ∈ allowed_countries,
-    #     valid_combinations
-    # )
-
-    # # # Remove R0 = 3.0, gen time = 4.0
-    # valid_combinations = filter(row -> 
-    #     !(Float64(row.R0) == 3.0) && !(Float64(row.generation_time) == 4.0),
-    #     valid_combinations
-    # )
-
-    # Filter to R0 = 2.0, gen time = 6.0
+    # Filter out combinations where mean_detection_time is > 64 - only for r0 = 2.0, gen time = 4.0
+    valid_combinations = filter(row ->
+        row.mean_detection_time <= 64,  # tune this threshold
+        valid_combinations
+    )
+    # Filter to R0 = 2.0, gen time = 4.0 for covid19
     valid_combinations = filter(row -> 
-        (Float64(row.R0) == 2.0) && (Float64(row.generation_time) == 6.0),
+        (Float64(row.R0) == 2.0) && (Float64(row.generation_time) == 4.0),
         valid_combinations
     )
 
     println("After filtering: $(nrow(valid_combinations)) valid combinations")
     println("(Excluded $(nrow(param_combinations) - nrow(valid_combinations)) with mean_detection_time > $max_detection_time_threshold or missing)")
     
-    # SKIP PROBLEMATIC COMBINATIONS
-    problematic_combinations = [
-        ("Uzbekistan", 2.5, 4.0),
-        ("Solomon Islands", 2.5, 4.0),
-        ("Sint Maarten", 2.5, 4.0),
-        ("Saint Maarten", 2.5, 4.0),
-        ("Uzbekistan", 3.0, 4.0),
-        ("Solomon Islands", 3.0, 4.0),
-        ("Sint Maarten", 3.0, 4.0),
-        ("Saint Maarten", 3.0, 4.0)
-    ]
-
-    problematic_countries = Set(["North Korea", "Uzbekistan"])
-
-    valid_combinations = filter(row -> 
-        (row.outbreak_country, Float64(row.R0), Float64(row.generation_time)) ∉ problematic_combinations,
-        valid_combinations
-    )
+    problematic_countries = Set(["North Korea", "Uzbekistan", "Madagascar", "Marshall Islands", "Central African Republic"])
 
     valid_combinations = filter(row ->
         (row.outbreak_country) ∉ problematic_countries,
         valid_combinations
     )
+
+    # valid_combinations = reverse(valid_combinations)
 
     println("Remaining combinations to process: $(nrow(valid_combinations))")
 
@@ -1165,170 +1159,309 @@ function run_simulations_from_merged_csv(
         println("="^80)
         flush(stdout)
         
-        # Create indexed combinations for this batch
-        indexed_combinations = [(i, row) for (i, row) in enumerate(eachrow(batch_combinations))]
-        
-        # Process batch in parallel
-        batch_results = pmap(indexed_combinations) do idx_and_row
-            idx, param_row = idx_and_row
-            global_idx = batch_start + idx - 1
-            
+        # --------------------------------------------------------------
+        # Phase 1 (main process): validate each combination, pre-filter the
+        # country data once, and build a per-combo spec. Doing the filter
+        # here (instead of inside every pmap task) avoids re-scanning the
+        # 900k-row merged table from every worker, every sample.
+        # --------------------------------------------------------------
+        # Phase 1a: data filtering (sequential, fast — avoids re-scanning
+        # the merged table from workers).
+        combo_specs_no_cache = NamedTuple[]
+        for (i, param_row) in enumerate(eachrow(batch_combinations))
+            global_idx = batch_start + i - 1
             R0 = Float64(param_row.R0)
             gen_time = Float64(param_row.generation_time)
             country = param_row.outbreak_country
             mean_det_time = param_row.mean_detection_time
-            
-            # Calculate max observation time for this simulation
             max_obs_time = mean_det_time + extra_time
-            
-            println("[$global_idx/$total_combinations] Processing: $country | R0=$R0 | gen_time=$gen_time")
-            
-            # Get data for this combination
-            country_data = filter(row -> 
-                row.R0 == R0 && 
-                row.generation_time == gen_time && 
+
+            country_data = filter(row ->
+                row.R0 == R0 &&
+                row.generation_time == gen_time &&
                 row.outbreak_country == country,
                 merged_data
             )
-            
+
             if nrow(country_data) == 0
                 println("[$global_idx/$total_combinations] WARNING: No data for $country (R0=$R0, gen_time=$gen_time), skipping...")
-                return nothing
+                continue
             end
-            
+
             sort!(country_data, :time)
-            
-            # Filter to max observation time
             country_trimmed = filter(row -> row.time <= max_obs_time, country_data)
-            
+
             if nrow(country_trimmed) == 0
                 println("[$global_idx/$total_combinations] WARNING: No data within observation window for $country, skipping...")
-                return nothing
+                continue
             end
-            
-            try
-                result = simulate_country_detection(
-                    country_trimmed,
-                    country,
-                    num_samples,
-                    R0,
-                    gen_time,
-                    icu_sampling_proportion,
-                    p_dets,  # Pass vector of all p_det values
-                    max_obs_time;
-                    turnaround_time = turnaround_time,
-                    n_hosp_samples_per_week = n_hosp_samples_per_week,
-                    verbose = false
-                )
 
-                icu_mean_time = isempty(result.icu_detection_times) ? NaN : mean(result.icu_detection_times)
-                icu_mean_cases = isempty(result.icu_local_cases_at_detection) ? NaN : mean(result.icu_local_cases_at_detection)
+            push!(combo_specs_no_cache, (
+                global_idx    = global_idx,
+                country       = country,
+                R0            = R0,
+                gen_time      = gen_time,
+                mean_det_time = mean_det_time,
+                max_obs_time  = max_obs_time,
+                country_data  = country_trimmed,
+            ))
+        end
 
-                hariss_mean_time = isempty(result.hariss_detection_times) ? NaN : mean(result.hariss_detection_times)
-                hariss_mean_cases = isempty(result.hariss_local_cases_at_detection) ? NaN : mean(result.hariss_local_cases_at_detection)
-                hariss_num_detections = length(result.hariss_detection_times)
-                
-                # Process results for each p_det configuration
-                ww_results_by_config = Dict{String, NamedTuple}()
-                
-                for (i, (label, p_det)) in enumerate(zip(config_labels, p_dets))
-                    ww_mean_time = isempty(result.airport_results[p_det][:detection_times]) ? NaN : 
-                                   mean(result.airport_results[p_det][:detection_times])
-                    ww_mean_cases = isempty(result.airport_results[p_det][:local_cases_at_detection]) ? NaN : 
-                                    mean(result.airport_results[p_det][:local_cases_at_detection])
-                    
-                    ww_results_by_config[label] = (
-                        detection_times = result.airport_results[p_det][:detection_times],
-                        mean_detection_time = ww_mean_time,
-                        local_cases_samples = result.airport_results[p_det][:local_cases_at_detection],
-                        mean_local_cases = ww_mean_cases,
-                        num_detections = length(result.airport_results[p_det][:detection_times])
-                    )
-                end
-                
-                println("[$global_idx/$total_combinations] ✓ $country: ICU=$(round(icu_mean_time, digits=2))d HARISS=$(round(hariss_mean_time, digits=2))d")
+        # Phase 1b: build one hariss_bg_cache per combination in parallel.
+        # build_ari_background is independent of importation data — only
+        # max_obs_time varies per combo; all other params are NHS config
+        # constants already resident on every worker. With 180 workers all
+        # 125 builds run simultaneously (~1 round × 7-10s) rather than
+        # sequentially on the main process (125 × 7-10s ≈ 950s).
+        println("  Pre-building $(length(combo_specs_no_cache)) HARISS background caches in parallel...")
+        flush(stdout)
+        hariss_caches = pmap(combo_specs_no_cache) do spec
+            NBPMscape.build_ari_background(;
+                max_observation_time            = Float64(spec.max_obs_time),
+                n_hosp_samples_per_week         = n_hosp_samples_per_week,
+                sample_allocation               = P_FROM_CONFIG.sample_allocation,
+                sample_proportion_adult         = P_FROM_CONFIG.sample_proportion_adult,
+                hariss_nhs_trust_sampling_sites = HARISS_SITES_FROM_CONFIG,
+                weight_samples_by               = P_FROM_CONFIG.weight_samples_by,
+                swab_time_mode                  = P_FROM_CONFIG.swab_time_mode,
+                swab_proportion_at_48h          = P_FROM_CONFIG.swab_proportion_at_48h,
+                proportion_hosp_swabbed         = P_FROM_CONFIG.proportion_hosp_swabbed,
+                ed_discharge_limit              = Float64(P_FROM_CONFIG.tdischarge_ed_upper_limit),
+                hosp_short_stay_limit           = Float64(P_FROM_CONFIG.tdischarge_hosp_short_stay_upper_limit),
+                hosp_ari_admissions             = Int(P_FROM_CONFIG.hosp_ari_admissions),
+                hosp_ari_admissions_adult_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_adult_p),
+                hosp_ari_admissions_child_p     = Float64(P_FROM_CONFIG.hosp_ari_admissions_child_p),
+                ed_ari_destinations_adult       = P_FROM_CONFIG.ed_ari_destinations_adult,
+                ed_ari_destinations_child       = P_FROM_CONFIG.ed_ari_destinations_child,
+            )
+        end
 
-                return (
-                    country = country,
-                    R0 = R0,
-                    gen_time = gen_time,
-                    mean_detection_time_from_csv = mean_det_time,
-                    max_observation_time = max_obs_time,
-                    ICU_mean_detection_time = icu_mean_time,
-                    ICU_detection_times = result.icu_detection_times,
-                    ICU_mean_local_cases = icu_mean_cases,
-                    ICU_local_cases_samples = result.icu_local_cases_at_detection,
-                    HARISS_mean_detection_time = hariss_mean_time,
-                    HARISS_detection_times = result.hariss_detection_times,
-                    HARISS_mean_local_cases = hariss_mean_cases,
-                    HARISS_local_cases_samples = result.hariss_local_cases_at_detection,
-                    HARISS_detections = hariss_num_detections,
-                    # Base p_det = 0.08, 10% sampling
-                    WW_008_10pct_mean_detection_time = ww_results_by_config["008_10pct"].mean_detection_time,
-                    WW_008_10pct_detection_times = ww_results_by_config["008_10pct"].detection_times,
-                    WW_008_10pct_mean_local_cases = ww_results_by_config["008_10pct"].mean_local_cases,
-                    WW_008_10pct_local_cases_samples = ww_results_by_config["008_10pct"].local_cases_samples,
-                    WW_008_10pct_detections = ww_results_by_config["008_10pct"].num_detections,
-                    # Base p_det = 0.08, 25% sampling
-                    WW_008_25pct_mean_detection_time = ww_results_by_config["008_25pct"].mean_detection_time,
-                    WW_008_25pct_detection_times = ww_results_by_config["008_25pct"].detection_times,
-                    WW_008_25pct_mean_local_cases = ww_results_by_config["008_25pct"].mean_local_cases,
-                    WW_008_25pct_local_cases_samples = ww_results_by_config["008_25pct"].local_cases_samples,
-                    WW_008_25pct_detections = ww_results_by_config["008_25pct"].num_detections,
-                    # Base p_det = 0.08, 50% sampling
-                    WW_008_50pct_mean_detection_time = ww_results_by_config["008_50pct"].mean_detection_time,
-                    WW_008_50pct_detection_times = ww_results_by_config["008_50pct"].detection_times,
-                    WW_008_50pct_mean_local_cases = ww_results_by_config["008_50pct"].mean_local_cases,
-                    WW_008_50pct_local_cases_samples = ww_results_by_config["008_50pct"].local_cases_samples,
-                    WW_008_50pct_detections = ww_results_by_config["008_50pct"].num_detections,
-                    # Base p_det = 0.08, 100% sampling
-                    WW_008_100pct_mean_detection_time = ww_results_by_config["008_100pct"].mean_detection_time,
-                    WW_008_100pct_detection_times = ww_results_by_config["008_100pct"].detection_times,
-                    WW_008_100pct_mean_local_cases = ww_results_by_config["008_100pct"].mean_local_cases,
-                    WW_008_100pct_local_cases_samples = ww_results_by_config["008_100pct"].local_cases_samples,
-                    WW_008_100pct_detections = ww_results_by_config["008_100pct"].num_detections,
-                    # Base p_det = 0.16, 10% sampling
-                    WW_016_10pct_mean_detection_time = ww_results_by_config["016_10pct"].mean_detection_time,
-                    WW_016_10pct_detection_times = ww_results_by_config["016_10pct"].detection_times,
-                    WW_016_10pct_mean_local_cases = ww_results_by_config["016_10pct"].mean_local_cases,
-                    WW_016_10pct_local_cases_samples = ww_results_by_config["016_10pct"].local_cases_samples,
-                    WW_016_10pct_detections = ww_results_by_config["016_10pct"].num_detections,
-                    # Base p_det = 0.16, 25% sampling
-                    WW_016_25pct_mean_detection_time = ww_results_by_config["016_25pct"].mean_detection_time,
-                    WW_016_25pct_detection_times = ww_results_by_config["016_25pct"].detection_times,
-                    WW_016_25pct_mean_local_cases = ww_results_by_config["016_25pct"].mean_local_cases,
-                    WW_016_25pct_local_cases_samples = ww_results_by_config["016_25pct"].local_cases_samples,
-                    WW_016_25pct_detections = ww_results_by_config["016_25pct"].num_detections,
-                    # Base p_det = 0.16, 50% sampling
-                    WW_016_50pct_mean_detection_time = ww_results_by_config["016_50pct"].mean_detection_time,
-                    WW_016_50pct_detection_times = ww_results_by_config["016_50pct"].detection_times,
-                    WW_016_50pct_mean_local_cases = ww_results_by_config["016_50pct"].mean_local_cases,
-                    WW_016_50pct_local_cases_samples = ww_results_by_config["016_50pct"].local_cases_samples,
-                    WW_016_50pct_detections = ww_results_by_config["016_50pct"].num_detections,
-                    # Base p_det = 0.16, 100% sampling
-                    WW_016_100pct_mean_detection_time = ww_results_by_config["016_100pct"].mean_detection_time,
-                    WW_016_100pct_detection_times = ww_results_by_config["016_100pct"].detection_times,
-                    WW_016_100pct_mean_local_cases = ww_results_by_config["016_100pct"].mean_local_cases,
-                    WW_016_100pct_local_cases_samples = ww_results_by_config["016_100pct"].local_cases_samples,
-                    WW_016_100pct_detections = ww_results_by_config["016_100pct"].num_detections,
-                    mean_latent_imports_per_sample = result.mean_latent_imports_per_sample,
-                    mean_infectious_imports_per_sample = result.mean_infectious_imports_per_sample,
-                    mean_detectable_imports_per_sample = result.mean_detectable_imports_per_sample
-                )
-            catch e
-                println("[$global_idx/$total_combinations] ERROR processing $country: $e")
-                return nothing
+        combo_specs = [(; spec..., hariss_bg_cache = cache)
+                       for (spec, cache) in zip(combo_specs_no_cache, hariss_caches)]
+
+        if isempty(combo_specs)
+            println("No valid combinations in this batch, skipping.")
+            continue
+        end
+
+        # --------------------------------------------------------------
+        # Phase 2: flatten (combination x sample) into a single pmap task
+        # list. Each task runs ONE Monte-Carlo sample, so big-population
+        # countries no longer block a worker serially through 100 samples.
+        # --------------------------------------------------------------
+        sample_tasks = Tuple{Int, Int}[]  # (combo_idx_in_specs, sample_id)
+        for (ci, _) in enumerate(combo_specs)
+            for s in 1:num_samples
+                push!(sample_tasks, (ci, s))
             end
         end
-        
+
+        println("Dispatching $(length(sample_tasks)) sample tasks ",
+                "($(length(combo_specs)) combinations × $num_samples samples) ",
+                "to $(nworkers()) workers...")
+        flush(stdout)
+
+        # CRITICAL: use a CachingPool so the closure (which captures the
+        # ~6 MB `combo_specs` bundle of per-country DataFrames) is shipped
+        # to each worker ONCE rather than being re-serialised on every
+        # one of the thousands of sample tasks. Without the caching pool,
+        # the driver process becomes a serialisation bottleneck and
+        # workers sit idle waiting for tasks to arrive.
+        # `batch_size` also groups small tasks per dispatch to amortise
+        # the remaining per-task overhead.
+        pool = CachingPool(workers())
+        sample_outputs = try
+            pmap(pool, sample_tasks; batch_size = 1) do task
+                ci, sample_id = task
+                spec = combo_specs[ci]
+                try
+                    res = simulate_single_sample(
+                        spec.country_data,
+                        spec.country,
+                        sample_id,
+                        spec.R0,
+                        spec.gen_time,
+                        icu_sampling_proportion,
+                        p_dets,
+                        spec.max_obs_time,
+                        spec.hariss_bg_cache;
+                        turnaround_time = turnaround_time,
+                        n_hosp_samples_per_week = n_hosp_samples_per_week,
+                        hariss_extra_days = hariss_extra_days,
+                        max_cases = max_cases
+                    )
+                    icu_str = if res.icu_detected && isfinite(res.icu_detection_time)
+                        string(round(Float64(res.icu_detection_time), digits=2)) * "d"
+                    else
+                        "not detected"
+                    end
+                    har_str = if res.hariss_detected && isfinite(res.hariss_detection_time)
+                        string(round(Float64(res.hariss_detection_time), digits=2)) * "d"
+                    else
+                        "not detected"
+                    end
+                    # Runs on workers — lines may interleave; includes batch for context.
+                    println("[$(spec.global_idx)/$total_combinations] [batch $batch_num/$num_batches] ",
+                            "Simulation $sample_id/$num_samples complete: ",
+                            "country=$(spec.country), R0=$(spec.R0), gen_time=$(spec.gen_time), ",
+                            "ICU detection time=$icu_str, HARISS detection time=$har_str")
+                    flush(stdout)
+                    return (ci = ci, ok = true, result = res, err = nothing)
+                catch e
+                    println("[$(spec.global_idx)/$total_combinations] [batch $batch_num/$num_batches] ",
+                            "Simulation $sample_id/$num_samples FAILED: country=$(spec.country), ",
+                            "R0=$(spec.R0), gen_time=$(spec.gen_time), error=$e")
+                    flush(stdout)
+                    return (ci = ci, ok = false, result = nothing, err = e)
+                end
+            end
+        finally
+            clear!(pool)
+        end
+
+        # --------------------------------------------------------------
+        # Phase 3 (main process): group sample outputs by combination and
+        # aggregate into the same per-combo NamedTuple the old pmap used
+        # to return, so the downstream CSV schema is unchanged.
+        # --------------------------------------------------------------
+        per_combo_samples = [Any[] for _ in 1:length(combo_specs)]
+        per_combo_errors  = [Any[] for _ in 1:length(combo_specs)]
+        for out in sample_outputs
+            if out.ok
+                push!(per_combo_samples[out.ci], out.result)
+            else
+                push!(per_combo_errors[out.ci], out.err)
+            end
+        end
+
+        batch_results = Vector{Any}(undef, length(combo_specs))
+        for (ci, spec) in enumerate(combo_specs)
+            samples = per_combo_samples[ci]
+            errs = per_combo_errors[ci]
+
+            if !isempty(errs)
+                # Surface the first error per combo but keep going with any
+                # successful samples (same permissive behaviour as before).
+                println("[$(spec.global_idx)/$total_combinations] WARN $(spec.country): $(length(errs))/$num_samples sample(s) failed -- first error: $(errs[1])")
+            end
+
+            if isempty(samples)
+                println("[$(spec.global_idx)/$total_combinations] ERROR $(spec.country): all samples failed, skipping row")
+                batch_results[ci] = nothing
+                continue
+            end
+
+            agg = aggregate_sample_results(samples, p_dets)
+
+            icu_mean_time = isempty(agg.icu_detection_times) ? NaN : mean(agg.icu_detection_times)
+            icu_mean_cases = isempty(agg.icu_local_cases_at_detection) ? NaN : mean(agg.icu_local_cases_at_detection)
+            hariss_mean_time = isempty(agg.hariss_detection_times) ? NaN : mean(agg.hariss_detection_times)
+            hariss_mean_cases = isempty(agg.hariss_local_cases_at_detection) ? NaN : mean(agg.hariss_local_cases_at_detection)
+            hariss_num_detections = length(agg.hariss_detection_times)
+
+            ww_results_by_config = Dict{String, NamedTuple}()
+            for (label, p_det) in zip(config_labels, p_dets)
+                ww_mean_time = isempty(agg.airport_results[p_det][:detection_times]) ? NaN :
+                               mean(agg.airport_results[p_det][:detection_times])
+                ww_mean_cases = isempty(agg.airport_results[p_det][:local_cases_at_detection]) ? NaN :
+                                mean(agg.airport_results[p_det][:local_cases_at_detection])
+                ww_results_by_config[label] = (
+                    detection_times = agg.airport_results[p_det][:detection_times],
+                    mean_detection_time = ww_mean_time,
+                    local_cases_samples = agg.airport_results[p_det][:local_cases_at_detection],
+                    mean_local_cases = ww_mean_cases,
+                    num_detections = length(agg.airport_results[p_det][:detection_times])
+                )
+            end
+
+            println("[$(spec.global_idx)/$total_combinations] ✓ $(spec.country): ICU=$(round(icu_mean_time, digits=2))d HARISS=$(round(hariss_mean_time, digits=2))d")
+
+            batch_results[ci] = (
+                country = spec.country,
+                R0 = spec.R0,
+                gen_time = spec.gen_time,
+                mean_detection_time_from_csv = spec.mean_det_time,
+                max_observation_time = spec.max_obs_time,
+                ICU_mean_detection_time = icu_mean_time,
+                ICU_detection_times = agg.icu_detection_times,
+                ICU_mean_local_cases = icu_mean_cases,
+                ICU_local_cases_samples = agg.icu_local_cases_at_detection,
+                HARISS_mean_detection_time = hariss_mean_time,
+                HARISS_detection_times = agg.hariss_detection_times,
+                HARISS_mean_local_cases = hariss_mean_cases,
+                HARISS_local_cases_samples = agg.hariss_local_cases_at_detection,
+                HARISS_detections = hariss_num_detections,
+                # Base p_det = 0.08, 10% sampling
+                WW_008_10pct_mean_detection_time = ww_results_by_config["008_10pct"].mean_detection_time,
+                WW_008_10pct_detection_times = ww_results_by_config["008_10pct"].detection_times,
+                WW_008_10pct_mean_local_cases = ww_results_by_config["008_10pct"].mean_local_cases,
+                WW_008_10pct_local_cases_samples = ww_results_by_config["008_10pct"].local_cases_samples,
+                WW_008_10pct_detections = ww_results_by_config["008_10pct"].num_detections,
+                # Base p_det = 0.08, 25% sampling
+                WW_008_25pct_mean_detection_time = ww_results_by_config["008_25pct"].mean_detection_time,
+                WW_008_25pct_detection_times = ww_results_by_config["008_25pct"].detection_times,
+                WW_008_25pct_mean_local_cases = ww_results_by_config["008_25pct"].mean_local_cases,
+                WW_008_25pct_local_cases_samples = ww_results_by_config["008_25pct"].local_cases_samples,
+                WW_008_25pct_detections = ww_results_by_config["008_25pct"].num_detections,
+                # Base p_det = 0.08, 50% sampling
+                WW_008_50pct_mean_detection_time = ww_results_by_config["008_50pct"].mean_detection_time,
+                WW_008_50pct_detection_times = ww_results_by_config["008_50pct"].detection_times,
+                WW_008_50pct_mean_local_cases = ww_results_by_config["008_50pct"].mean_local_cases,
+                WW_008_50pct_local_cases_samples = ww_results_by_config["008_50pct"].local_cases_samples,
+                WW_008_50pct_detections = ww_results_by_config["008_50pct"].num_detections,
+                # Base p_det = 0.08, 100% sampling
+                WW_008_100pct_mean_detection_time = ww_results_by_config["008_100pct"].mean_detection_time,
+                WW_008_100pct_detection_times = ww_results_by_config["008_100pct"].detection_times,
+                WW_008_100pct_mean_local_cases = ww_results_by_config["008_100pct"].mean_local_cases,
+                WW_008_100pct_local_cases_samples = ww_results_by_config["008_100pct"].local_cases_samples,
+                WW_008_100pct_detections = ww_results_by_config["008_100pct"].num_detections,
+                # Base p_det = 0.16, 10% sampling
+                WW_016_10pct_mean_detection_time = ww_results_by_config["016_10pct"].mean_detection_time,
+                WW_016_10pct_detection_times = ww_results_by_config["016_10pct"].detection_times,
+                WW_016_10pct_mean_local_cases = ww_results_by_config["016_10pct"].mean_local_cases,
+                WW_016_10pct_local_cases_samples = ww_results_by_config["016_10pct"].local_cases_samples,
+                WW_016_10pct_detections = ww_results_by_config["016_10pct"].num_detections,
+                # Base p_det = 0.16, 25% sampling
+                WW_016_25pct_mean_detection_time = ww_results_by_config["016_25pct"].mean_detection_time,
+                WW_016_25pct_detection_times = ww_results_by_config["016_25pct"].detection_times,
+                WW_016_25pct_mean_local_cases = ww_results_by_config["016_25pct"].mean_local_cases,
+                WW_016_25pct_local_cases_samples = ww_results_by_config["016_25pct"].local_cases_samples,
+                WW_016_25pct_detections = ww_results_by_config["016_25pct"].num_detections,
+                # Base p_det = 0.16, 50% sampling
+                WW_016_50pct_mean_detection_time = ww_results_by_config["016_50pct"].mean_detection_time,
+                WW_016_50pct_detection_times = ww_results_by_config["016_50pct"].detection_times,
+                WW_016_50pct_mean_local_cases = ww_results_by_config["016_50pct"].mean_local_cases,
+                WW_016_50pct_local_cases_samples = ww_results_by_config["016_50pct"].local_cases_samples,
+                WW_016_50pct_detections = ww_results_by_config["016_50pct"].num_detections,
+                # Base p_det = 0.16, 100% sampling
+                WW_016_100pct_mean_detection_time = ww_results_by_config["016_100pct"].mean_detection_time,
+                WW_016_100pct_detection_times = ww_results_by_config["016_100pct"].detection_times,
+                WW_016_100pct_mean_local_cases = ww_results_by_config["016_100pct"].mean_local_cases,
+                WW_016_100pct_local_cases_samples = ww_results_by_config["016_100pct"].local_cases_samples,
+                WW_016_100pct_detections = ww_results_by_config["016_100pct"].num_detections,
+                mean_latent_imports_per_sample = agg.mean_latent_imports_per_sample,
+                mean_infectious_imports_per_sample = agg.mean_infectious_imports_per_sample,
+                mean_detectable_imports_per_sample = agg.mean_detectable_imports_per_sample
+            )
+        end
+
         # Filter out nothing results and append to existing results
         valid_results = filter(x -> !isnothing(x), batch_results)
-        
+
         if !isempty(valid_results)
             new_results_df = DataFrame(valid_results)
             append!(results_df, new_results_df)
         end
-        
+
+        # Explicitly release large batch-local objects before GC so the
+        # next batch starts with a clean memory slate on main and workers.
+        sample_outputs = nothing
+        hariss_caches  = nothing
+        combo_specs    = nothing
+        batch_results  = nothing
+        GC.gc()
+        @everywhere GC.gc()
+
         # SAVE AFTER EACH BATCH using safe write function
         save_success = safe_csv_write(output_path, results_df)
         
@@ -1359,19 +1492,20 @@ end
 
 # Resolve paths relative to the repository root so the script is portable
 project_root = normpath(joinpath(@__DIR__, "..", ".."))
-input_csv_path = "/Users/reddy/AWW_and_ICU/global_model/pgfgleam/all_results/global/daily_imports_sensitivity.csv"
-output_csv_path = "/Users/reddy/AWW_and_ICU/global_model/pgfgleam/all_results/local/full_ICU_AWW_HARISS_result.csv"
+input_csv_path = "/Users/reddy/AWW_and_ICU/global_model/pgfgleam/all_results/global/daily_imports_influenza.csv"
+output_csv_path = "/Users/reddy/AWW_and_ICU/global_model/pgfgleam/all_results/local/influenza_results.csv"
 
 results = run_simulations_from_merged_csv(
     input_csv_path;
-    num_samples = 100,
+    num_samples = 50,
     turnaround_time = 3.0,
     max_detection_time_threshold = 200.0,
-    extra_time = 35.0,
+    extra_time = 50.0,
     icu_sampling_proportion = 0.10,
     n_hosp_samples_per_week = Int(P_FROM_CONFIG.n_hosp_samples_per_week),
     output_path = output_csv_path,
-    batch_size = 125
+    batch_size = 12, 
+    max_cases = 1000
 )
 
 println("\n✓ ICU + AWW + HARISS simulations complete!")

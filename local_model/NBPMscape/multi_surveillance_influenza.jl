@@ -28,15 +28,15 @@ end
 @everywhere using Distributions
 @everywhere using CSV
 
-@everywhere const CONFIG_REL_PATH = "config/outbreak_params_covid19_like.yaml"
+@everywhere const CONFIG_REL_PATH = "config/outbreak_params_influenza_like.yaml"
 @everywhere const CONFIG_ABS_PATH = joinpath(pkgdir(NBPMscape), CONFIG_REL_PATH)
 @everywhere const CONFIG_DATA     = NBPMscape.load_config(CONFIG_ABS_PATH)
 
-@everywhere const INFECTIVITY_FOR_R0_COVID = Dict(
-    1.5 => 5.740442959665717,
-    2.0 => 7.909172103056187,
-    2.5 => 9.763825466244938,
-    3.0 => 12.314589631224113,
+@everywhere const INFECTIVITY_FOR_R0_INFLUENZA = Dict(
+    1.5 => 9.861059848839812,
+    2.0 => 13.509938212723691,
+    2.5 => 18.574936904423197,
+    3.0 => 22.985815931675493,
 )
 
 @everywhere function apply_yaml_scalars(P::NamedTuple, config::Dict)
@@ -194,7 +194,7 @@ end
     max_observation_time::Float64,
     hariss_bg_cache,
     hariss_bg_cache_enhanced;
-    mean_infectious_period::Float64          = 8.0/3.0,
+    mean_infectious_period::Float64          = 0.99,
     turnaround_time::Float64                 = 3.0,
     n_hosp_samples_per_week::Int             = Int(P_FROM_CONFIG.n_hosp_samples_per_week),
     n_hosp_samples_per_week_enhanced::Int    = 1200,
@@ -209,7 +209,7 @@ end
     fixed_shape = 1000.0
 
     base_params = merge(P_FROM_CONFIG, (
-        infectivity      = INFECTIVITY_FOR_R0_COVID[R0],
+        infectivity      = INFECTIVITY_FOR_R0_INFLUENZA[R0],
         latent_scale     = latent_period / fixed_shape,
         infectious_scale = infectious_period / fixed_shape,
         infectious_shape = fixed_shape,
@@ -649,10 +649,10 @@ end
 # ============================================================================
 # Scenario parameters
 # ============================================================================
-const SCENARIO_R0                = 2.0
-const SCENARIO_GEN_TIME          = 4.0
+const SCENARIO_R0                = 1.5
+const SCENARIO_GEN_TIME          = 3.5
 const SCENARIO_BASE_PDET         = 0.16
-const SCENARIO_SAMPLING_FRACTION = 0.01 # Change to 5pct for comparison
+const SCENARIO_SAMPLING_FRACTION = 0.01 # Change to 5pct for comparison
 const SCENARIO_COUNTRY           = "Switzerland"
 const AWW_FALSE_POSITIVE_RATE    = 0.04
 
@@ -661,8 +661,8 @@ const N_HOSP_SAMPLES_ENHANCED    = 1200
 const PHL_COLLECTION_BASELINE    = [2, 5]
 const PHL_COLLECTION_ENHANCED    = [2, 3, 4, 5, 6]
 
-input_csv_path  = "global_model/pgfgleam/all_results/global/daily_imports_sensitivity.csv"
-output_csv_path = "global_model/pgfgleam/all_results/local/multi_covid19_1pct.csv"
+input_csv_path  = "global_model/pgfgleam/all_results/global/daily_imports_influenza.csv"
+output_csv_path = "global_model/pgfgleam/all_results/local/multi_influenza_1pct.csv"
 
 run_multitype_comparison(;
     csv_path                         = input_csv_path,
@@ -670,7 +670,7 @@ run_multitype_comparison(;
     num_samples                      = 250,
     turnaround_time                  = 3.0,
     max_detection_time_threshold     = 100.0,
-    extra_time                       = 60.0,
+    extra_time                       = 35.0,
     icu_sampling_proportion          = 0.20,
     n_hosp_samples_per_week          = N_HOSP_SAMPLES_BASELINE,
     n_hosp_samples_per_week_enhanced = N_HOSP_SAMPLES_ENHANCED,
@@ -682,7 +682,7 @@ run_multitype_comparison(;
     sampling_fraction                = SCENARIO_SAMPLING_FRACTION,
     country                          = SCENARIO_COUNTRY,
     false_positive_rate              = AWW_FALSE_POSITIVE_RATE,
-    max_cases                        = 10000,
+    max_cases                        = 100000,
 )
 
-println("\n✓ multitype_surveillance complete!")
+println("\n✓ multi_surveillance_influenza complete!")
