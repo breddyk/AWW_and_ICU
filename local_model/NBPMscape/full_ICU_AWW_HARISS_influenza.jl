@@ -1492,8 +1492,8 @@ end
 
 # Resolve paths relative to the repository root so the script is portable
 project_root = normpath(joinpath(@__DIR__, "..", ".."))
-input_csv_path = "/Users/reddy/AWW_and_ICU/global_model/pgfgleam/all_results/global/daily_imports_influenza.csv"
-output_csv_path = "/Users/reddy/AWW_and_ICU/global_model/pgfgleam/all_results/local/influenza_results.csv"
+input_csv_path = "AWW_and_ICU/global_model/pgfgleam/all_results/global/daily_imports_influenza.csv"
+output_csv_path = "AWW_and_ICU/global_model/pgfgleam/all_results/local/influenza_results.csv"
 
 results = run_simulations_from_merged_csv(
     input_csv_path;
