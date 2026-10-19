@@ -32,10 +32,13 @@
 # Output: one row per (country, sample, rate_set, B, swab ratio).
 # Plot with scripts/plot_hariss_sensitivity.py.
 #
-# Usage (defaults shown):
+# Usage (defaults shown; N_WORKERS defaults to CPU threads - 1, max 24):
 #   DISEASE=covid N_SAMPLES=100 R0=2.0 GEN_TIME=6.0 \
-#   COUNTRIES="Spain;Germany;United States;Japan" \
+#   COUNTRIES="Spain;Germany;United States;Japan" N_WORKERS=7 \
 #   julia --project=local_model local_model/NBPMscape/hariss_sensitivity.jl
+#
+# Quick timing test before a full run:
+#   N_SAMPLES=4 COUNTRIES=Spain N_WORKERS=4 julia --project=local_model local_model/NBPMscape/hariss_sensitivity.jl
 # ============================================================================
 
 using Pkg
@@ -51,9 +54,12 @@ using Distributed
 using Random
 using Dates
 
-let n = haskey(ENV, "SLURM_CPUS_PER_TASK") ?
-    min(parse(Int, ENV["SLURM_CPUS_PER_TASK"]) - 1, 24) : 24
-addprocs(n)
+# Workers: N_WORKERS if set, else the SLURM allocation minus one (main
+# process), else this machine's CPU threads minus one. Capped at 24.
+let n = haskey(ENV, "N_WORKERS")           ? parse(Int, ENV["N_WORKERS"]) :
+        haskey(ENV, "SLURM_CPUS_PER_TASK") ? parse(Int, ENV["SLURM_CPUS_PER_TASK"]) - 1 :
+                                             Sys.CPU_THREADS - 1
+addprocs(clamp(n, 1, 24))
 end
 
 @everywhere using Pkg
