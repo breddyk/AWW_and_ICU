@@ -1125,7 +1125,7 @@ function simgeneration(p, prevgen::Array{Infection}; maxtime = Inf)
 	)
 end
 
-function simtree(p; region="TLI3", initialtime=0.0, maxtime=30.0, maxgenerations::Int64=10, initialcontact=:H)
+function simtree(p; region="TLI3", initialtime=0.0, maxtime=30.0, maxgenerations::Int64=10, initialcontact=:H, max_cases::Int=typemax(Int))
 	# clustthreshold::Float64 = 0.005,
 	
 	@assert maxgenerations > 0
