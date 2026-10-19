@@ -33,7 +33,7 @@
 # Plot with scripts/plot_hariss_sensitivity.py.
 #
 # Usage (defaults shown; N_WORKERS defaults to CPU threads - 1, max 24):
-#   DISEASE=covid N_SAMPLES=100 R0=2.0 GEN_TIME=6.0 \
+#   DISEASE=covid N_SAMPLES=100 R0=2.0 GEN_TIME=4.0 MAX_CASES=1000 \
 #   COUNTRIES="Spain;Germany;United States;Japan" N_WORKERS=7 \
 #   julia --project=local_model local_model/NBPMscape/hariss_sensitivity.jl
 #
@@ -79,13 +79,16 @@ const DISEASE   = lowercase(get(ENV, "DISEASE", "covid"))       # "covid" or "in
 const N_SAMPLES = parse(Int, get(ENV, "N_SAMPLES", "100"))
 # The influenza import CSV only contains R0 = 1.5, generation time = 3.5
 const R0_VALUE  = parse(Float64, get(ENV, "R0", DISEASE == "influenza" ? "1.5" : "2.0"))
-const GEN_TIME  = parse(Float64, get(ENV, "GEN_TIME", DISEASE == "influenza" ? "3.5" : "6.0"))
+const GEN_TIME  = parse(Float64, get(ENV, "GEN_TIME", DISEASE == "influenza" ? "3.5" : "4.0"))  # 4.0 = main analysis
 const COUNTRIES = String.(split(get(ENV, "COUNTRIES", "Spain;Germany;United States;Japan"), ";"))
 
 const EXTRA_TIME = 50.0   # as in the main analysis call
 @everywhere const TURNAROUND_TIME         = 3.0
 @everywhere const ICU_SAMPLING_PROPORTION = 0.10
-@everywhere const MAX_CASES               = 1000
+# Per-tree cap in simtree (stops a tree once it exceeds this many infections).
+# Must be well above the local case counts at which ICU/HARISS detect, or
+# detection is truncated.
+@everywhere const MAX_CASES = $(parse(Int, get(ENV, "MAX_CASES", "1000")))
 
 # Grid axis 1: share of ED ARI attendances sequenced. With a uniform swab
 # proportion, a case's chance of being sequenced is ~ n_hosp_samples_per_week / B
