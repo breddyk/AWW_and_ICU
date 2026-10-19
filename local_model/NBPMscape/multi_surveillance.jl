@@ -656,7 +656,7 @@ const SCENARIO_SAMPLING_FRACTION = 0.01 # Change to 5pct for comparison
 const SCENARIO_COUNTRY           = "Switzerland"
 const AWW_FALSE_POSITIVE_RATE    = 0.04
 
-const N_HOSP_SAMPLES_BASELINE    = Int(P_FROM_CONFIG.n_hosp_samples_per_week)  # 600 from YAML
+const N_HOSP_SAMPLES_BASELINE    = Int(P_FROM_CONFIG.n_hosp_samples_per_week)  # 300 from YAML
 const N_HOSP_SAMPLES_ENHANCED    = 1200
 const PHL_COLLECTION_BASELINE    = [2, 5]
 const PHL_COLLECTION_ENHANCED    = [2, 3, 4, 5, 6]
