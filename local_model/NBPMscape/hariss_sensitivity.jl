@@ -11,10 +11,10 @@
 #         :original  - rates in config/outbreak_params_<disease>.yaml (main analysis)
 #         :corrected - halved competing-route rates from *_20261008.yaml, so the
 #                      mean onset-to-admission matches the literature value
-#   (2) ED ARI background B (`hosp_ari_admissions`, weekly ED ARI attendances)
-#   (3) Swab proportion, either uniform or split by ED destination
-#         (discharged vs admitted), applied identically to pathogen X cases
-#         and to the background
+#   (2) Share of ED ARI attendances sequenced (= weekly samples / ED ARI
+#       background B, set via `hosp_ari_admissions`)
+#   (3) Ratio of swab proportions, admitted : discharged from ED, applied
+#       identically to pathogen X cases and to the background
 #
 # Design: per (country, sample) the imports are drawn once and the outbreak
 # tree is grown once per rate set. Every HARISS scenario is then evaluated on
@@ -29,7 +29,7 @@
 # proportion_hosp_swabbed = 1.0. With a uniform proportion this matches the
 # package behaviour.
 #
-# Output: one row per (country, sample, rate_set, B, swab scenario).
+# Output: one row per (country, sample, rate_set, B, swab ratio).
 # Plot with scripts/plot_hariss_sensitivity.py.
 #
 # Usage (defaults shown):
@@ -81,22 +81,30 @@ const EXTRA_TIME = 50.0   # as in the main analysis call
 @everywhere const ICU_SAMPLING_PROPORTION = 0.10
 @everywhere const MAX_CASES               = 1000
 
-# Weekly ED ARI attendances. 6088 = value used in the main analysis;
-# 15856 / 27894 = updated summer / winter; 21875 = midpoint; 34868 = winter + 25%.
-const B_VALUES = [6088, 15856, 21875, 27894, 34868]
+# Grid axis 1: share of ED ARI attendances sequenced. With a uniform swab
+# proportion, a case's chance of being sequenced is ~ n_hosp_samples_per_week / B
+# (the swab proportion cancels), so the background B enters only through this
+# share. Each share sets B = 300 / share:
+#   4.93% (main analysis, B = 6088), 3%, 2%, 1.5%, 1%, 0.5%.
+# The updated estimates (summer 15856 -> 1.9%, winter 27894 -> 1.1%) fall inside
+# the range and are marked on the plots rather than used as grid points.
+const B_VALUES = [6088, 10000, 15000, 20000, 30000, 60000]
 
-# Swab proportions (discharged from ED, admitted from ED)
+# Grid axis 2: ratio of swab proportions, admitted : discharged from ED.
+# Admitted fixed at 90%; ratio 1 = same proportion for all (main analysis),
+# ratio 18 = ~5% of discharged swabbed (upstream suggestion).
 const SWAB_SCENARIOS = [
-    (name = "uniform_0.90",   discharged = 0.90, admitted = 0.90),  # main analysis
-    (name = "uniform_0.25",   discharged = 0.25, admitted = 0.25),  # updated single value
-    (name = "split_0.05_0.90", discharged = 0.05, admitted = 0.90),
-    (name = "split_0.05_0.60", discharged = 0.05, admitted = 0.60),
+    (name = "ratio_1",   discharged = 0.90, admitted = 0.90),
+    (name = "ratio_2",   discharged = 0.45, admitted = 0.90),
+    (name = "ratio_4.5", discharged = 0.20, admitted = 0.90),
+    (name = "ratio_18",  discharged = 0.05, admitted = 0.90),
 ]
 
-# Full B x swab grid on corrected rates, plus the main-analysis configuration
-# on both rate sets to isolate the effect of the pathway-rate fix.
+# Full grid on corrected rates, plus the main-analysis configuration on the
+# original rates; comparing the two at (6088, ratio_1) isolates the effect of
+# the pathway-rate fix.
 const MAIN_B    = 6088
-const MAIN_SWAB = "uniform_0.90"
+const MAIN_SWAB = "ratio_1"
 
 # AWW: effective p_det = base_pdet x sampling_fraction. Only the weakest
 # (8% x 10%) and strongest (16% x 100%) configurations are recorded, which
@@ -411,7 +419,9 @@ end
                     sample_id          = sample_id,
                     rate_set           = String(rate_set),
                     ed_ari_background  = B,
+                    seq_share          = p.n_hosp_samples_per_week / B,
                     swab_scenario      = swab.name,
+                    swab_ratio         = swab.admitted / swab.discharged,
                     swab_discharged    = swab.discharged,
                     swab_admitted      = swab.admitted,
                     is_main_analysis   = rate_set === :original && B == main_b && swab.name == main_swab,
@@ -440,7 +450,8 @@ function main()
     println("HARISS SENSITIVITY ($DISEASE, R0=$R0_VALUE, gen_time=$GEN_TIME)")
     println("Countries: ", join(COUNTRIES, ", "))
     println("Samples per country: $N_SAMPLES   Workers: $(nworkers())")
-    println("ED ARI background values: $B_VALUES")
+    println("ED ARI background values: $B_VALUES (share sequenced: ",
+            join(["$(round(100 * P_ORIGINAL.n_hosp_samples_per_week / b, digits = 2))%" for b in B_VALUES], ", "), ")")
     println("Swab scenarios: ", join([s.name for s in SWAB_SCENARIOS], ", "))
     for rs in (:original, :corrected)
         println("  $rs rates: ", join(["$k=$(round(getfield(RATE_SETS[rs], k), digits=4))" for k in RATE_KEYS], ", "))
