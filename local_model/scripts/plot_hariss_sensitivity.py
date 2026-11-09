@@ -9,7 +9,7 @@ Figure 1 (_detection): median HARISS detection time vs share sequenced, one line
     configuration (original healthcare rates); vertical lines mark the updated
     summer/winter background estimates; horizontal lines are median ICU and AWW
     detection times.
-Figure 2 (_lead_time): heatmap of median AWW lead time over the earliest of ICU
+Figure 2 (_lead_time): heatmap of median AWW (CTT=1) lead time over the earliest of ICU
     and HARISS across the grid.
 Figure 3 (_hariss_heatmap): heatmap of median HARISS detection time across the grid.
 
@@ -26,7 +26,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-N_SAMPLES_PER_WEEK = 300
 UPDATED_ESTIMATES = {"summer": 15856, "winter": 27894}  # weekly ED ARI attendances
 RATIO_LABEL = "Swab ratio (admitted : discharged)"
 SHARE_LABEL = "ED ARI attendances sequenced (%)"
@@ -42,10 +41,10 @@ def summarise(df):
     df["share_pct"] = (100 * df.seq_share).round(2)
     df["hariss_c"] = censor(df.hariss_time, df.max_obs_time)
     df["icu_c"] = censor(df.icu_time, df.max_obs_time)
-    df["aww_c"] = censor(df.aww_time_high, df.max_obs_time)
+    df["aww_c"] = censor(df.aww_ctt1_time, df.max_obs_time)
     df["local_c"] = np.minimum(df.hariss_c, df.icu_c)
-    df["lead_high"] = df.local_c - df.aww_c
-    df["lead_low"] = df.local_c - censor(df.aww_time_low, df.max_obs_time)
+    df["lead_ctt1"] = df.local_c - df.aww_c
+    df["lead_ctt2"] = df.local_c - censor(df.aww_ctt2_time, df.max_obs_time)
     df["hariss_detected"] = np.isfinite(df.hariss_time)
     keys = ["country", "rate_set", "share_pct", "swab_ratio", "is_main_analysis"]
     return df.groupby(keys).agg(
@@ -55,8 +54,8 @@ def summarise(df):
         hariss_pct_detected=("hariss_detected", "mean"),
         icu_med=("icu_c", "median"),
         aww_med=("aww_c", "median"),
-        lead_high=("lead_high", "median"),
-        lead_low=("lead_low", "median"),
+        lead_ctt1=("lead_ctt1", "median"),
+        lead_ctt2=("lead_ctt2", "median"),
     ).reset_index()
 
 
@@ -68,7 +67,7 @@ def share_label(v, main_shares):
     return f"{v:.1f}\n(main)" if v in main_shares else f"{v:g}"
 
 
-def plot_detection(s, out):
+def plot_detection(s, out, n_samples_per_week):
     countries = list(dict.fromkeys(s.country))
     fig, axes = plt.subplots(1, len(countries), figsize=(4.2 * len(countries), 4.2))
     axes = np.atleast_1d(axes)
@@ -84,9 +83,9 @@ def plot_detection(s, out):
             ax.scatter(main.share_pct, main.hariss_med, marker="*", s=180, color="black", zorder=5,
                        label="Main analysis (original healthcare rates)")
         ax.axhline(corr.icu_med.median(), ls="--", color="grey", label="ICU")
-        ax.axhline(corr.aww_med.median(), ls=":", color="green", label="AWW (16% x 100%)")
+        ax.axhline(corr.aww_med.median(), ls=":", color="green", label="AWW (CTT=1)")
         for name, b in UPDATED_ESTIMATES.items():
-            x = 100 * N_SAMPLES_PER_WEEK / b
+            x = 100 * n_samples_per_week / b
             ax.axvline(x, color="lightgrey", lw=0.8, zorder=0)
             ax.annotate(f"updated {name}\nestimate", (x, 1), xycoords=("data", "axes fraction"),
                         xytext=(2, -2), textcoords="offset points", va="top", fontsize=7, color="grey")
@@ -138,11 +137,13 @@ def main():
         sys.exit(__doc__)
     path = sys.argv[1]
     out = sys.argv[2] if len(sys.argv) > 2 else path.rsplit(".", 1)[0]
-    s = summarise(pd.read_csv(path))
+    raw = pd.read_csv(path)
+    n_samples_per_week = float((raw.seq_share * raw.ed_ari_background).median())
+    s = summarise(raw)
     s.to_csv(f"{out}_summary.csv", index=False)
-    plot_detection(s, out)
-    plot_heatmap(s, "lead_high", "AWW lead time (days)",
-                 "Median AWW lead time (16% x 100%) over earliest of ICU and HARISS",
+    plot_detection(s, out, n_samples_per_week)
+    plot_heatmap(s, "lead_ctt1", "AWW lead time (days)",
+                 "Median AWW (CTT=1) lead time over earliest of ICU and HARISS",
                  "lead_time", out, "viridis")
     plot_heatmap(s, "hariss_med", "HARISS detection time (days)",
                  "Median HARISS detection time", "hariss_heatmap", out, "magma_r")
