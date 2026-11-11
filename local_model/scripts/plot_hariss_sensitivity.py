@@ -4,11 +4,12 @@ Axes of the grid (corrected healthcare rates):
   x: share of ED ARI attendances sequenced (weekly samples / weekly ED ARI background)
   y: ratio of swab proportions, admitted : discharged from ED
 
-Figure 1 (_detection): median HARISS detection time vs share sequenced, one line
-    per swab ratio, one panel per origin country. The star is the main-analysis
-    configuration (original healthcare rates); vertical lines mark the updated
-    summer/winter background estimates; horizontal lines are median ICU and AWW
-    detection times.
+Figure 1 (_detection): median HARISS detection time (IQR band, corrected healthcare
+    rates), one row per origin country. Left: background ED ARI attendances as a
+    multiple of the main-analysis value (swab ratio 1:1), with the updated
+    summer/winter estimates marked. Right: swab ratio as a multiple of the
+    main-analysis 1:1 (main-analysis background). The star is the main analysis
+    (original healthcare rates); horizontal lines are median ICU and AWW detection.
 Figure 2 (_lead_time): heatmap of median AWW (CTT=1) lead time over the earliest of ICU
     and HARISS across the grid.
 Figure 3 (_hariss_heatmap): heatmap of median HARISS detection time across the grid.
@@ -46,7 +47,7 @@ def summarise(df):
     df["lead_ctt1"] = df.local_c - df.aww_c
     df["lead_ctt2"] = df.local_c - censor(df.aww_ctt2_time, df.max_obs_time)
     df["hariss_detected"] = np.isfinite(df.hariss_time)
-    keys = ["country", "rate_set", "share_pct", "swab_ratio", "is_main_analysis"]
+    keys = ["country", "rate_set", "ed_ari_background", "share_pct", "swab_ratio", "is_main_analysis"]
     return df.groupby(keys).agg(
         hariss_med=("hariss_c", "median"),
         hariss_q25=("hariss_c", lambda x: x.quantile(0.25)),
@@ -67,40 +68,54 @@ def share_label(v, main_shares):
     return f"{v:.1f}\n(main)" if v in main_shares else f"{v:g}"
 
 
+def _mult_label(m):
+    return "Baseline" if np.isclose(m, 1) else f"{m:.1f}\u00d7".replace(".0\u00d7", "\u00d7")
+
+
+def _detection_panel(ax, g, x, main, ref, xlabel):
+    """One-factor line: median HARISS detection (IQR band) vs multiplier x."""
+    g = g.sort_values(x)
+    line, = ax.plot(g[x], g.hariss_med, marker="o", color="tab:red",
+                    label="HARISS (corrected healthcare rates)")
+    ax.fill_between(g[x], g.hariss_q25, g.hariss_q75, color=line.get_color(), alpha=0.15)
+    if not main.empty:
+        ax.scatter([1] * len(main), main.hariss_med, marker="*", s=180, color="black", zorder=5,
+                   label="Main analysis (original healthcare rates)")
+    ax.axhline(ref.icu_med.median(), ls="--", color="grey", label="ICU")
+    ax.axhline(ref.aww_med.median(), ls=":", color="green", label="AWW (CTT=1)")
+    ax.set_xscale("log")
+    ticks = sorted(set(g[x]))
+    ax.set_xticks(ticks, [_mult_label(t) for t in ticks])
+    ax.minorticks_off()
+    ax.set_xlabel(xlabel)
+
+
 def plot_detection(s, out, n_samples_per_week):
+    """Rows = countries; left = background ARI attendances (swab ratio 1:1),
+    right = swab ratio (main-analysis background). Both relative to baseline."""
     countries = list(dict.fromkeys(s.country))
-    fig, axes = plt.subplots(1, len(countries), figsize=(4.2 * len(countries), 4.2))
-    axes = np.atleast_1d(axes)
-    for ax, country in zip(axes, countries):
+    fig, axes = plt.subplots(len(countries), 2, figsize=(9, 3.2 * len(countries)),
+                             squeeze=False, sharey="row")
+    for row, country in zip(axes, countries):
         c = s[s.country == country]
-        corr = c[c.rate_set == "corrected"]
-        for ratio, g in corr.groupby("swab_ratio"):
-            g = g.sort_values("share_pct")
-            line, = ax.plot(g.share_pct, g.hariss_med, marker="o", label=f"HARISS, swab ratio {ratio_label(ratio)}")
-            ax.fill_between(g.share_pct, g.hariss_q25, g.hariss_q75, color=line.get_color(), alpha=0.12)
+        corr = c[c.rate_set == "corrected"].copy()
         main = c[c.is_main_analysis]
-        if not main.empty:
-            ax.scatter(main.share_pct, main.hariss_med, marker="*", s=180, color="black", zorder=5,
-                       label="Main analysis (original healthcare rates)")
-        ax.axhline(corr.icu_med.median(), ls="--", color="grey", label="ICU")
-        ax.axhline(corr.aww_med.median(), ls=":", color="green", label="AWW (CTT=1)")
+        base_b = main.ed_ari_background.iloc[0] if not main.empty else corr.ed_ari_background.min()
+        corr["b_mult"] = corr.ed_ari_background / base_b
+        _detection_panel(row[0], corr[corr.swab_ratio == 1], "b_mult", main, corr,
+                         "Background ED ARI attendances (relative to baseline)")
         for name, b in UPDATED_ESTIMATES.items():
-            x = 100 * n_samples_per_week / b
-            ax.axvline(x, color="lightgrey", lw=0.8, zorder=0)
-            ax.annotate(f"{name} estimate", (x, 0), xycoords=("data", "axes fraction"),
-                        xytext=(-3, 4), textcoords="offset points", rotation=90,
-                        ha="right", va="bottom", fontsize=7, color="grey")
-        ax.set_xscale("log")
-        ticks = sorted(set(corr.share_pct))
-        ax.set_xticks(ticks, [share_label(t, set(main.share_pct)) for t in ticks])
-        ax.minorticks_off()
-        ax.invert_xaxis()  # most to least sequenced, as in the heatmaps
-        ax.set_title(country)
-        ax.set_xlabel(SHARE_LABEL)
-    axes[0].set_ylabel("Median detection time (days)")
-    handles, labels = axes[0].get_legend_handles_labels()
+            xm = b / base_b
+            row[0].axvline(xm, color="lightgrey", lw=0.8, zorder=0)
+            row[0].annotate(f"{name} estimate", (xm, 0), xycoords=("data", "axes fraction"),
+                            xytext=(-3, 4), textcoords="offset points", rotation=90,
+                            ha="right", va="bottom", fontsize=7, color="grey")
+        _detection_panel(row[1], corr[corr.ed_ari_background == base_b], "swab_ratio", main, corr,
+                         "Swab ratio, admitted : discharged (relative to baseline 1:1)")
+        row[0].set_ylabel(f"{country}\nMedian detection time (days)")
+    handles, labels = axes[0][0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=4, fontsize=8, frameon=False)
-    fig.tight_layout(rect=(0, 0.14, 1, 1))
+    fig.tight_layout(rect=(0, 0.06 if len(countries) > 1 else 0.12, 1, 1))
     fig.savefig(f"{out}_detection.pdf")
     fig.savefig(f"{out}_detection.png", dpi=200)
 
