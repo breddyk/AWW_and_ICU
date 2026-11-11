@@ -168,13 +168,6 @@ def plot_detection_delta(d, out):
         ax.minorticks_off()
         ax.set_xlabel(xlabel)
     axes[0].set_ylim(bottom=-1)
-    b = d.drop_duplicates(["country", "base_b"])
-    for name, est in UPDATED_ESTIMATES.items():
-        xm = (est / b.base_b).median()
-        axes[0].axvline(xm, color="lightgrey", lw=0.8, zorder=0)
-        axes[0].annotate(f"{name} estimate", (xm, 1), xycoords=("data", "axes fraction"),
-                         xytext=(-3, -4), textcoords="offset points", rotation=90,
-                         ha="right", va="top", fontsize=7, color="grey")
     axes[0].set_ylabel("Change in HARISS detection time\nrelative to baseline (days)")
     fig.tight_layout()
     fig.savefig(f"{out}_detection.pdf")
