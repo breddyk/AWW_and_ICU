@@ -8,8 +8,9 @@ Figure 1 (_detection): median HARISS detection time (IQR band, corrected healthc
     rates), one row per origin country. Left: background ED ARI attendances as a
     multiple of the main-analysis value (swab ratio 1:1), with the updated
     summer/winter estimates marked. Right: swab ratio as a multiple of the
-    main-analysis 1:1 (main-analysis background). The star is the main analysis
-    (original healthcare rates); horizontal lines are median ICU and AWW detection.
+    main-analysis 1:1 (main-analysis background). Horizontal lines are median ICU
+    and AWW detection. The original-rates main analysis is in the summary CSV
+    (rate_set = original) for reporting the rate-correction effect in the text.
 Figure 2 (_lead_time): heatmap of median AWW (CTT=1) lead time over the earliest of ICU
     and HARISS across the grid.
 Figure 3 (_hariss_heatmap): heatmap of median HARISS detection time across the grid.
@@ -65,22 +66,18 @@ def ratio_label(r):
 
 
 def share_label(v, main_shares):
-    return f"{v:.1f}\n(main)" if v in main_shares else f"{v:g}"
+    return f"{v:.1f}\n(baseline)" if v in main_shares else f"{v:g}"
 
 
 def _mult_label(m):
     return "Baseline" if np.isclose(m, 1) else f"{m:.1f}\u00d7".replace(".0\u00d7", "\u00d7")
 
 
-def _detection_panel(ax, g, x, main, ref, xlabel):
+def _detection_panel(ax, g, x, ref, xlabel):
     """One-factor line: median HARISS detection (IQR band) vs multiplier x."""
     g = g.sort_values(x)
-    line, = ax.plot(g[x], g.hariss_med, marker="o", color="tab:red",
-                    label="HARISS (corrected healthcare rates)")
+    line, = ax.plot(g[x], g.hariss_med, marker="o", color="tab:red", label="HARISS")
     ax.fill_between(g[x], g.hariss_q25, g.hariss_q75, color=line.get_color(), alpha=0.15)
-    if not main.empty:
-        ax.scatter([1] * len(main), main.hariss_med, marker="*", s=180, color="black", zorder=5,
-                   label="Main analysis (original healthcare rates)")
     ax.axhline(ref.icu_med.median(), ls="--", color="grey", label="ICU")
     ax.axhline(ref.aww_med.median(), ls=":", color="green", label="AWW (CTT=1)")
     ax.set_xscale("log")
@@ -102,7 +99,7 @@ def plot_detection(s, out, n_samples_per_week):
         main = c[c.is_main_analysis]
         base_b = main.ed_ari_background.iloc[0] if not main.empty else corr.ed_ari_background.min()
         corr["b_mult"] = corr.ed_ari_background / base_b
-        _detection_panel(row[0], corr[corr.swab_ratio == 1], "b_mult", main, corr,
+        _detection_panel(row[0], corr[corr.swab_ratio == 1], "b_mult", corr,
                          "Background ED ARI attendances (relative to baseline)")
         for name, b in UPDATED_ESTIMATES.items():
             xm = b / base_b
@@ -110,7 +107,7 @@ def plot_detection(s, out, n_samples_per_week):
             row[0].annotate(f"{name} estimate", (xm, 0), xycoords=("data", "axes fraction"),
                             xytext=(-3, 4), textcoords="offset points", rotation=90,
                             ha="right", va="bottom", fontsize=7, color="grey")
-        _detection_panel(row[1], corr[corr.ed_ari_background == base_b], "swab_ratio", main, corr,
+        _detection_panel(row[1], corr[corr.ed_ari_background == base_b], "swab_ratio", corr,
                          "Swab ratio, admitted : discharged (relative to baseline 1:1)")
         row[0].set_ylabel(f"{country}\nMedian detection time (days)")
     handles, labels = axes[0][0].get_legend_handles_labels()
