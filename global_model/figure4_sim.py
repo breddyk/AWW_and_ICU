@@ -39,6 +39,8 @@ P_DET = 0.16 * 0.10          # 16% per-sample detection x 10% random sampling
 FPRS = [0.008, 0.04]
 TEST_FREQS = [1, 3]          # 1 = Figure 4 (daily), 3 = Supp. Fig. 7 (every 3 days)
 FREQ_COMPARISON = [1, 3, 7]  # FPR 0, CTT=1: daily vs every 3 vs every 7 days
+ALL_COUNTRIES_MAX_MDT = 64   # same country filter as the main analysis (R0 2.0, gen time 4.0)
+TRIALS_PER_COUNTRY = 20_000  # all-country pooled comparison, equal weight per country
 RETEST_DELAY = 3
 NUM_TRIALS = 250_000
 MAX_CONSECUTIVE = 4
@@ -140,7 +142,7 @@ def plot_comparison(res, perfect, fpr, test_freq, out_prefix):
     plt.close(fig)
 
 
-def plot_frequency_comparison(by_freq, out_prefix):
+def plot_frequency_comparison(by_freq, out_prefix, xmax=90):
     """FPR 0, CTT=1: detection-time distributions for each testing frequency
     (daily, every 3, every 7 days; top to bottom), stacked, with a dashed
     vertical line at the mean detection day. No text labels, as in Figure 4."""
@@ -152,15 +154,54 @@ def plot_frequency_comparison(by_freq, out_prefix):
         ax.tick_params(axis="both", which="major", labelsize=18)
         # One bin per testing interval, centred on the possible detection days
         # (test day + retest delay), so densities are per day and comparable.
-        bins = np.arange(RETEST_DELAY - f / 2, 100 + f, f)
-        plot_split_histogram(ax, days, by_freq[f].is_true, bins, colors.get(f, "grey"), "", (0, 90))
+        bins = np.arange(RETEST_DELAY - f / 2, xmax + f, f)
+        plot_split_histogram(ax, days, by_freq[f].is_true, bins, colors.get(f, "grey"), "", (0, xmax))
         m = days.mean()
         ax.axvline(m, color="black", linestyle="--", linewidth=2)
-        ax.set_xlim(0, 90)
+        ax.set_xlim(0, xmax)
+        ax.set_ylim(bottom=0)
     fig.tight_layout()
     fig.savefig(f"{out_prefix}.pdf")
     fig.savefig(f"{out_prefix}.png", dpi=200)
     plt.close(fig)
+
+
+def run_all_countries(df_all, rng):
+    """FPR 0, CTT=1 testing-frequency comparison pooled over every origin
+    country in the main analysis, each country weighted equally."""
+    keep = df_all.groupby("outbreak_country").mean_detection_time.first()
+    countries = keep[keep <= ALL_COUNTRIES_MAX_MDT].index
+    by_freq = {f: [] for f in FREQ_COMPARISON}
+    per_country = []
+    for c in countries:
+        mu = (df_all[df_all.outbreak_country == c].sort_values("time")
+              .daily_detectable_imports.fillna(0).values)
+        for f in FREQ_COMPARISON:
+            d = simulate_independent_sliding_window(mu, P_DET, 0.0, rng, num_trials=TRIALS_PER_COUNTRY,
+                                                    test_freq=f, max_consecutive=1)[1]
+            by_freq[f].append(d[["confirm_day", "is_true"]])
+            per_country.append({"country": c, "test_freq": f, "n_detected": len(d),
+                                "pct_detected": 100 * len(d) / TRIALS_PER_COUNTRY,
+                                "mean_confirm_day": d.confirm_day.mean() if len(d) else np.nan,
+                                "median_confirm_day": d.confirm_day.median() if len(d) else np.nan})
+    by_freq = {f: pd.concat(v, ignore_index=True) for f, v in by_freq.items()}
+    tag = f"AllCountries_delay{RETEST_DELAY}_fpr0_ctt1_freq_comparison"
+    plot_frequency_comparison(by_freq, os.path.join(OUT_DIR, tag), xmax=100)
+    pd.DataFrame(per_country).to_csv(os.path.join(OUT_DIR, f"{tag}_per_country.csv"), index=False)
+    hist = pd.concat([d.confirm_day.value_counts().sort_index().rename("n").rename_axis("confirm_day")
+                      .reset_index().assign(test_freq=f) for f, d in by_freq.items()])
+    hist.to_csv(os.path.join(OUT_DIR, f"{tag}_pooled_counts.csv"), index=False)
+    print(f"\n--- All {len(countries)} countries | FPR=0 | CTT=1 | testing frequency comparison ---")
+    rows = []
+    for f, d in by_freq.items():
+        pct = 100 * len(d) / (TRIALS_PER_COUNTRY * len(countries))
+        print(f"every {f} day(s): mean day={d.confirm_day.mean():.1f} | median day={d.confirm_day.median():.0f} "
+              f"| detected {pct:.1f}%")
+        rows.append({"country": f"All ({len(countries)})", "fpr": 0.0, "test_freq": f, "ctt": 1,
+                     "reference_no_fpr": True, "n_detected": len(d), "pct_detected": pct,
+                     "ppv_pct": 100.0, "mean_confirm_day": d.confirm_day.mean(),
+                     "median_confirm_day": d.confirm_day.median()})
+    return rows
 
 
 def main():
@@ -210,7 +251,8 @@ def main():
                         "mean_confirm_day": d.confirm_day.mean(),
                         "median_confirm_day": d.confirm_day.median()})
         print(f"every {f} day(s): mean day={d.confirm_day.mean():.1f} | median day={d.confirm_day.median():.0f}")
-    summary = pd.DataFrame(summary).drop_duplicates(["fpr", "test_freq", "ctt"])
+    summary += run_all_countries(pd.read_csv(CSV_PATH).query("R0 == @R0 and generation_time == @GEN_TIME"), rng)
+    summary = pd.DataFrame(summary).drop_duplicates(["country", "fpr", "test_freq", "ctt"])
     summary.to_csv(os.path.join(OUT_DIR, "figure4_summary.csv"), index=False)
     print(f"\nWrote figures, per-trial data and figure4_summary.csv to {OUT_DIR}/")
 
