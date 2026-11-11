@@ -39,7 +39,8 @@ P_DET = 0.16 * 0.10          # 16% per-sample detection x 10% random sampling
 FPRS = [0.008, 0.04]
 TEST_FREQS = [1, 3]          # 1 = Figure 4 (daily), 3 = Supp. Fig. 7 (every 3 days)
 FREQ_COMPARISON = [1, 3, 7]  # FPR 0, CTT=1: daily vs every 3 vs every 7 days
-ALL_COUNTRIES_MAX_MDT = 64   # same country filter as the main analysis (R0 2.0, gen time 4.0)
+# Same origin countries as the Figure 2 AWW mean (covid19_results.csv, R0 2.0, gen time 4.0)
+FIG2_RESULTS_CSV = "pgfgleam/all_results/local/covid19_results.csv"
 TRIALS_PER_COUNTRY = 20_000  # all-country pooled comparison, equal weight per country
 RETEST_DELAY = 3
 NUM_TRIALS = 250_000
@@ -167,10 +168,11 @@ def plot_frequency_comparison(by_freq, out_prefix, xmax=90):
 
 
 def run_all_countries(df_all, rng):
-    """FPR 0, CTT=1 testing-frequency comparison pooled over every origin
-    country in the main analysis, each country weighted equally."""
-    keep = df_all.groupby("outbreak_country").mean_detection_time.first()
-    countries = keep[keep <= ALL_COUNTRIES_MAX_MDT].index
+    """FPR 0, CTT=1 testing-frequency comparison pooled over the origin
+    countries used for the Figure 2 AWW mean, each country weighted equally."""
+    fig2 = pd.read_csv(FIG2_RESULTS_CSV)
+    fig2_countries = set(fig2[(fig2.R0 == R0) & (fig2.gen_time == GEN_TIME)].country)
+    countries = sorted(set(df_all.outbreak_country) & fig2_countries)
     by_freq = {f: [] for f in FREQ_COMPARISON}
     per_country = []
     for c in countries:
