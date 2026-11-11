@@ -50,7 +50,9 @@ def set_figure_format():
     pgfgleam/scipy/seaborn just for fonts)."""
     plt.rcParams.update({
         "font.family": "serif",
-        "font.serif": ["Computer Modern Roman", "Times New Roman", "DejaVu Serif",
+        # Liberation Serif is metric-compatible with Times New Roman, which the
+        # other figures use on macOS; it stands in where Times is not installed.
+        "font.serif": ["Computer Modern Roman", "Times New Roman", "Liberation Serif", "DejaVu Serif",
                        "New Century Schoolbook", "Century Schoolbook L", "Utopia",
                        "Palatino", "Charter", "Bookman"],
         "mathtext.fontset": "cm",
