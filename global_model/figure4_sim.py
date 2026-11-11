@@ -139,8 +139,9 @@ def plot_comparison(res, perfect, fpr, test_freq, out_prefix):
 
 
 def plot_frequency_comparison(by_freq, out_prefix):
-    """FPR 0, CTT=1: detection-time distributions for each testing frequency,
-    stacked, with a vertical line at the mean detection day."""
+    """FPR 0, CTT=1: detection-time distributions for each testing frequency
+    (daily, every 3, every 7 days; top to bottom), stacked, with a dashed
+    vertical line at the mean detection day. No text labels, as in Figure 4."""
     freqs = list(by_freq)
     fig, axes = plt.subplots(len(freqs), 1, figsize=(15, 5.3 * len(freqs)), sharex=True, sharey=True)
     colors = {1: "red", 3: "darkorange", 7: "purple"}
@@ -153,15 +154,7 @@ def plot_frequency_comparison(by_freq, out_prefix):
         plot_split_histogram(ax, days, by_freq[f].is_true, bins, colors.get(f, "grey"), "", (0, 90))
         m = days.mean()
         ax.axvline(m, color="black", linestyle="--", linewidth=2)
-        ax.text(m + 0.8, 0.95, f"mean = {m:.1f} d", transform=ax.get_xaxis_transform(),
-                ha="left", va="top", fontsize=18,
-                bbox=dict(facecolor="white", edgecolor="none", pad=2))
-        label = "Daily" if f == 1 else f"Every {f} days"
-        ax.text(0.01, 0.95, label, transform=ax.transAxes, ha="left", va="top",
-                fontsize=20, fontweight="bold")
         ax.set_xlim(0, 90)
-    axes[-1].set_xlabel("Detection day", fontsize=20)
-    axes[0].set_ylim(0, 1.2 * max(ax.get_ylim()[1] for ax in axes))  # headroom for labels
     fig.tight_layout()
     fig.savefig(f"{out_prefix}.pdf")
     fig.savefig(f"{out_prefix}.png", dpi=200)
