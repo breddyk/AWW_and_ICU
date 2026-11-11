@@ -2,7 +2,8 @@
 
 Axes of the grid (corrected healthcare rates):
   x: share of ED ARI attendances sequenced (weekly samples / weekly ED ARI background)
-  y: ratio of swab proportions, admitted : discharged from ED
+  y: proportion of discharged ED patients swabbed, relative to baseline 90%
+     (admitted patients fixed at 90%)
 
 Figure 1 (_detection): change in HARISS detection time relative to each sample's own
     baseline (corrected rates, baseline background, swab ratio 1:1), pooled across
@@ -33,7 +34,7 @@ import numpy as np
 import pandas as pd
 
 UPDATED_ESTIMATES = {"summer": 15856, "winter": 27894}  # weekly ED ARI attendances
-RATIO_LABEL = "Swab ratio (admitted : discharged)"
+RATIO_LABEL = "Discharged ED patients swabbed\n(relative to baseline 90%)"
 SHARE_LABEL = "ED ARI attendances sequenced (%)"
 
 
@@ -65,8 +66,10 @@ def summarise(df):
     ).reset_index()
 
 
-def ratio_label(r):
-    return f"{r:g}:1"
+def _frac_label(r):
+    """Discharged swab proportion relative to baseline, from the swab ratio
+    (admitted fixed at 90%, so ratio r means discharged swabbed at 90% / r)."""
+    return "Baseline" if np.isclose(r, 1) else f"1/{r:g}"
 
 
 def share_label(v, main_shares):
@@ -85,7 +88,7 @@ def _detection_panel(ax, g, x, ref, xlabel):
     ax.axhline(ref.aww_med.median(), ls=":", color="green", label="AWW (CTT=1)")
     ax.set_xscale("log")
     ticks = sorted(set(g[x]))
-    ax.set_xticks(ticks, [_mult_label(t) for t in ticks])
+    ax.set_xticks(ticks, [(_frac_label if x == "swab_ratio" else _mult_label)(t) for t in ticks])
     ax.minorticks_off()
     ax.set_xlabel(xlabel)
 
@@ -111,7 +114,7 @@ def plot_detection(s, out, n_samples_per_week):
                             xytext=(-3, 4), textcoords="offset points", rotation=90,
                             ha="right", va="bottom", fontsize=7, color="grey")
         _detection_panel(row[1], corr[corr.ed_ari_background == base_b], "swab_ratio", corr,
-                         "Swab ratio, admitted : discharged (relative to baseline 1:1)")
+                         "Discharged ED patients swabbed (relative to baseline 90%)")
         row[0].set_ylabel(f"{country}\nMedian detection time (days)")
     handles, labels = axes[0][0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=4, fontsize=8, frameon=False)
@@ -146,7 +149,7 @@ def plot_detection_delta(d, out):
     (baseline background)."""
     panels = [
         (d[d.swab_ratio == 1], "b_mult", "Background ED ARI attendances (relative to baseline)"),
-        (d[d.ed_ari_background == d.base_b], "swab_ratio", "Swab ratio, admitted : discharged (relative to baseline 1:1)"),
+        (d[d.ed_ari_background == d.base_b], "swab_ratio", "Discharged ED patients swabbed (relative to baseline 90%)"),
     ]
     fig, axes = plt.subplots(1, 2, figsize=(9, 3.6), sharey=True)
     rows = []
@@ -164,7 +167,7 @@ def plot_detection_delta(d, out):
         ax.axhline(0, color="black", lw=0.8)
         ax.set_xscale("log")
         ticks = sorted(set(st[x]))
-        ax.set_xticks(ticks, [_mult_label(t) for t in ticks])
+        ax.set_xticks(ticks, [(_frac_label if x == "swab_ratio" else _mult_label)(t) for t in ticks])
         ax.minorticks_off()
         ax.set_xlabel(xlabel)
     axes[0].set_ylim(bottom=-1)
@@ -193,7 +196,7 @@ def plot_heatmap(s, value, cbar_label, title, out_suffix, out, cmap):
                 ax.text(j, i, f"{v:.0f}", ha="center", va="center", fontsize=8,
                         color="black" if 0.299 * r + 0.587 * g + 0.114 * b > 0.5 else "white")
         ax.set_xticks(range(mat.shape[1]), [share_label(v, main_shares) for v in mat.columns], fontsize=8)
-        ax.set_yticks(range(mat.shape[0]), [ratio_label(r) for r in mat.index], fontsize=8)
+        ax.set_yticks(range(mat.shape[0]), [_frac_label(r) for r in mat.index], fontsize=8)
         ax.set_title(country)
         ax.set_xlabel(SHARE_LABEL)
         fig.colorbar(im, ax=ax, fraction=0.046, label=cbar_label)
