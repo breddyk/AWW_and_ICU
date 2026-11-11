@@ -8,8 +8,8 @@ Figure 1 (_detection): median HARISS detection time (IQR band, corrected healthc
     rates), one row per origin country. Left: background ED ARI attendances as a
     multiple of the main-analysis value (swab ratio 1:1), with the updated
     summer/winter estimates marked. Right: swab ratio as a multiple of the
-    main-analysis 1:1 (main-analysis background). Horizontal lines are median ICU
-    and AWW detection. The original-rates main analysis is in the summary CSV
+    main-analysis 1:1 (main-analysis background). The horizontal line is median AWW
+    (CTT=1) detection; ICU is omitted as it detects later than HARISS throughout. The original-rates main analysis is in the summary CSV
     (rate_set = original) for reporting the rate-correction effect in the text.
 Figure 2 (_lead_time): heatmap of median AWW (CTT=1) lead time over the earliest of ICU
     and HARISS across the grid.
@@ -78,7 +78,6 @@ def _detection_panel(ax, g, x, ref, xlabel):
     g = g.sort_values(x)
     line, = ax.plot(g[x], g.hariss_med, marker="o", color="tab:red", label="HARISS")
     ax.fill_between(g[x], g.hariss_q25, g.hariss_q75, color=line.get_color(), alpha=0.15)
-    ax.axhline(ref.icu_med.median(), ls="--", color="grey", label="ICU")
     ax.axhline(ref.aww_med.median(), ls=":", color="green", label="AWW (CTT=1)")
     ax.set_xscale("log")
     ticks = sorted(set(g[x]))
