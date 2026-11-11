@@ -6,9 +6,8 @@ Axes of the grid (corrected healthcare rates):
 
 Figure 1 (_detection): change in HARISS detection time relative to each sample's own
     baseline (corrected rates, baseline background, swab ratio 1:1), pooled across
-    countries (median and IQR of paired per-sample differences; thin lines are
-    individual countries). Left: background multiplier; right: swab-ratio
-    multiplier. The dotted line is AWW (CTT=1) time minus baseline HARISS time.
+    countries: mean of paired per-sample differences with 95% CI of the mean.
+    Left: background multiplier; right: swab-ratio multiplier.
 Figure 1b (_detection_by_country): median HARISS detection time (IQR band, corrected healthcare
     rates), one row per origin country. Left: background ED ARI attendances as a
     multiple of the main-analysis value (swab ratio 1:1), with the updated
@@ -141,47 +140,43 @@ def paired_deltas(raw):
 
 
 def plot_detection_delta(d, out):
-    """Pooled across countries: change in HARISS detection vs baseline.
+    """Pooled across countries: mean change in HARISS detection vs each sample's
+    baseline, with a 95% confidence interval of the mean (1.96 x SEM).
     Left: background ED ARI attendances (swab ratio 1:1). Right: swab ratio
-    (baseline background). Thin lines are individual countries' medians."""
-    q = lambda p: (lambda x: x.quantile(p))
+    (baseline background)."""
     panels = [
         (d[d.swab_ratio == 1], "b_mult", "Background ED ARI attendances (relative to baseline)"),
         (d[d.ed_ari_background == d.base_b], "swab_ratio", "Swab ratio, admitted : discharged (relative to baseline 1:1)"),
     ]
-    aww = d.drop_duplicates(["country", "sample_id"]).aww_delta.median()
-    countries = list(dict.fromkeys(d.country))
-    fig, axes = plt.subplots(1, 2, figsize=(9, 3.8), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.6), sharey=True)
     rows = []
     for ax, (g, x, xlabel) in zip(axes, panels):
-        for country, gc in g.groupby("country", sort=False):
-            m = gc.groupby(x).delta.median()
-            ax.plot(m.index, m.values, color="grey", lw=0.8, alpha=0.6, zorder=1)
-        st = g.groupby(x).delta.agg(med="median", q25=q(0.25), q75=q(0.75)).reset_index()
+        st = g.groupby(x).delta.agg(mean="mean", sd="std", n="count",
+                                    median="median",
+                                    q25=lambda v: v.quantile(0.25),
+                                    q75=lambda v: v.quantile(0.75)).reset_index()
+        half = 1.96 * st.sd.fillna(0) / np.sqrt(st.n)
+        st["ci_low"], st["ci_high"] = st["mean"] - half, st["mean"] + half
         st.insert(0, "factor", x)
         rows.append(st)
-        line, = ax.plot(st[x], st.med, marker="o", color="tab:red", zorder=3,
-                        label=f"HARISS, pooled ({len(countries)} countries)")
-        ax.fill_between(st[x], st.q25, st.q75, color=line.get_color(), alpha=0.15, zorder=2)
-        ax.plot([], [], color="grey", lw=0.8, alpha=0.6, label="HARISS, individual countries")
+        line, = ax.plot(st[x], st["mean"], marker="o", color="tab:red", zorder=3)
+        ax.fill_between(st[x], st.ci_low, st.ci_high, color=line.get_color(), alpha=0.2, zorder=2)
         ax.axhline(0, color="black", lw=0.8)
-        ax.axhline(aww, ls=":", color="green", label="AWW (CTT=1)")
         ax.set_xscale("log")
         ticks = sorted(set(st[x]))
         ax.set_xticks(ticks, [_mult_label(t) for t in ticks])
         ax.minorticks_off()
         ax.set_xlabel(xlabel)
+    axes[0].set_ylim(bottom=-1)
     b = d.drop_duplicates(["country", "base_b"])
     for name, est in UPDATED_ESTIMATES.items():
         xm = (est / b.base_b).median()
         axes[0].axvline(xm, color="lightgrey", lw=0.8, zorder=0)
-        axes[0].annotate(f"{name} estimate", (xm, 0), xycoords=("data", "axes fraction"),
-                         xytext=(-3, 4), textcoords="offset points", rotation=90,
-                         ha="right", va="bottom", fontsize=7, color="grey")
+        axes[0].annotate(f"{name} estimate", (xm, 1), xycoords=("data", "axes fraction"),
+                         xytext=(-3, -4), textcoords="offset points", rotation=90,
+                         ha="right", va="top", fontsize=7, color="grey")
     axes[0].set_ylabel("Change in HARISS detection time\nrelative to baseline (days)")
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=3, fontsize=8, frameon=False)
-    fig.tight_layout(rect=(0, 0.1, 1, 1))
+    fig.tight_layout()
     fig.savefig(f"{out}_detection.pdf")
     fig.savefig(f"{out}_detection.png", dpi=200)
     pd.concat(rows).to_csv(f"{out}_delta_summary.csv", index=False)
