@@ -87,8 +87,9 @@ def plot_detection(s, out, n_samples_per_week):
         for name, b in UPDATED_ESTIMATES.items():
             x = 100 * n_samples_per_week / b
             ax.axvline(x, color="lightgrey", lw=0.8, zorder=0)
-            ax.annotate(f"updated {name}\nestimate", (x, 1), xycoords=("data", "axes fraction"),
-                        xytext=(2, -2), textcoords="offset points", va="top", fontsize=7, color="grey")
+            ax.annotate(f"{name} estimate", (x, 0), xycoords=("data", "axes fraction"),
+                        xytext=(-3, 4), textcoords="offset points", rotation=90,
+                        ha="right", va="bottom", fontsize=7, color="grey")
         ax.set_xscale("log")
         ticks = sorted(set(corr.share_pct))
         ax.set_xticks(ticks, [share_label(t, set(main.share_pct)) for t in ticks])
