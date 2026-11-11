@@ -38,6 +38,7 @@ R0, GEN_TIME = 2.0, 4.0
 P_DET = 0.16 * 0.10          # 16% per-sample detection x 10% random sampling
 FPRS = [0.008, 0.04]
 TEST_FREQS = [1, 3]          # 1 = Figure 4 (daily), 3 = Supp. Fig. 7 (every 3 days)
+FREQ_COMPARISON = [1, 3, 7]  # FPR 0, CTT=1: daily vs every 3 vs every 7 days
 RETEST_DELAY = 3
 NUM_TRIALS = 250_000
 MAX_CONSECUTIVE = 4
@@ -120,6 +121,8 @@ def plot_split_histogram(ax, detection_days, is_true_positive, bins, color, labe
 def plot_comparison(res, perfect, fpr, test_freq, out_prefix):
     fig, axes = plt.subplots(3, 1, figsize=(15, 16))
     xlim = {"Ireland": (0, 60), "Singapore": (0, 80)}.get(COUNTRY, (0, 90))
+    if test_freq == 1:
+        xlim = (0, 70)
     bins = np.arange(0, 100)
     colors = {1: "red", 2: "gray", 3: "blue"}
     labels = {1: "First", 2: "Two", 3: "Three"}
@@ -130,6 +133,36 @@ def plot_comparison(res, perfect, fpr, test_freq, out_prefix):
         ax.hist(perfect[1].confirm_day, bins=bins, density=True, histtype="step",
                 color="black", linestyle="--", linewidth=2)
         ax.set_xlim(xlim)
+    fig.savefig(f"{out_prefix}.pdf")
+    fig.savefig(f"{out_prefix}.png", dpi=200)
+    plt.close(fig)
+
+
+def plot_frequency_comparison(by_freq, out_prefix):
+    """FPR 0, CTT=1: detection-time distributions for each testing frequency,
+    stacked, with a vertical line at the mean detection day."""
+    freqs = list(by_freq)
+    fig, axes = plt.subplots(len(freqs), 1, figsize=(15, 5.3 * len(freqs)), sharex=True, sharey=True)
+    colors = {1: "red", 3: "darkorange", 7: "purple"}
+    for ax, f in zip(axes, freqs):
+        days = by_freq[f].confirm_day
+        ax.tick_params(axis="both", which="major", labelsize=18)
+        # One bin per testing interval, centred on the possible detection days
+        # (test day + retest delay), so densities are per day and comparable.
+        bins = np.arange(RETEST_DELAY - f / 2, 100 + f, f)
+        plot_split_histogram(ax, days, by_freq[f].is_true, bins, colors.get(f, "grey"), "", (0, 90))
+        m = days.mean()
+        ax.axvline(m, color="black", linestyle="--", linewidth=2)
+        ax.text(m + 0.8, 0.95, f"mean = {m:.1f} d", transform=ax.get_xaxis_transform(),
+                ha="left", va="top", fontsize=18,
+                bbox=dict(facecolor="white", edgecolor="none", pad=2))
+        label = "Daily" if f == 1 else f"Every {f} days"
+        ax.text(0.01, 0.95, label, transform=ax.transAxes, ha="left", va="top",
+                fontsize=20, fontweight="bold")
+        ax.set_xlim(0, 90)
+    axes[-1].set_xlabel("Detection day", fontsize=20)
+    axes[0].set_ylim(0, 1.2 * max(ax.get_ylim()[1] for ax in axes))  # headroom for labels
+    fig.tight_layout()
     fig.savefig(f"{out_prefix}.pdf")
     fig.savefig(f"{out_prefix}.png", dpi=200)
     plt.close(fig)
@@ -166,7 +199,24 @@ def main():
                 if n:
                     print(f"CTT={n}: N={rec['n_detected']} | PPV={rec['ppv_pct']:.1f}% | "
                           f"mean day={rec['mean_confirm_day']:.1f} | median day={rec['median_confirm_day']:.0f}")
-    pd.DataFrame(summary).to_csv(os.path.join(OUT_DIR, "figure4_summary.csv"), index=False)
+    # FPR 0, CTT=1: compare testing frequencies
+    by_freq = {f: simulate_independent_sliding_window(mu_traj, P_DET, 0.0, rng, test_freq=f,
+                                                      max_consecutive=1)[1]
+               for f in FREQ_COMPARISON}
+    tag = f"{COUNTRY}_delay{RETEST_DELAY}_fpr0_ctt1_freq_comparison"
+    plot_frequency_comparison(by_freq, os.path.join(OUT_DIR, tag))
+    pd.concat([d.assign(test_freq=f) for f, d in by_freq.items()]).to_csv(
+        os.path.join(OUT_DIR, f"{tag}_trials.csv.gz"), index=False)
+    print(f"\n--- {COUNTRY} | FPR=0 | CTT=1 | testing frequency comparison ---")
+    for f, d in by_freq.items():
+        summary.append({"country": COUNTRY, "fpr": 0.0, "test_freq": f, "ctt": 1,
+                        "reference_no_fpr": True, "n_detected": len(d),
+                        "pct_detected": 100 * len(d) / NUM_TRIALS, "ppv_pct": 100 * d.is_true.mean(),
+                        "mean_confirm_day": d.confirm_day.mean(),
+                        "median_confirm_day": d.confirm_day.median()})
+        print(f"every {f} day(s): mean day={d.confirm_day.mean():.1f} | median day={d.confirm_day.median():.0f}")
+    summary = pd.DataFrame(summary).drop_duplicates(["fpr", "test_freq", "ctt"])
+    summary.to_csv(os.path.join(OUT_DIR, "figure4_summary.csv"), index=False)
     print(f"\nWrote figures, per-trial data and figure4_summary.csv to {OUT_DIR}/")
 
 
