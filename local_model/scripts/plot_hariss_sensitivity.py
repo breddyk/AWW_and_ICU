@@ -4,7 +4,12 @@ Axes of the grid (corrected healthcare rates):
   x: share of ED ARI attendances sequenced (weekly samples / weekly ED ARI background)
   y: ratio of swab proportions, admitted : discharged from ED
 
-Figure 1 (_detection): median HARISS detection time (IQR band, corrected healthcare
+Figure 1 (_detection): change in HARISS detection time relative to each sample's own
+    baseline (corrected rates, baseline background, swab ratio 1:1), pooled across
+    countries (median and IQR of paired per-sample differences; thin lines are
+    individual countries). Left: background multiplier; right: swab-ratio
+    multiplier. The dotted line is AWW (CTT=1) time minus baseline HARISS time.
+Figure 1b (_detection_by_country): median HARISS detection time (IQR band, corrected healthcare
     rates), one row per origin country. Left: background ED ARI attendances as a
     multiple of the main-analysis value (swab ratio 1:1), with the updated
     summer/winter estimates marked. Right: swab ratio as a multiple of the
@@ -112,8 +117,74 @@ def plot_detection(s, out, n_samples_per_week):
     handles, labels = axes[0][0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=4, fontsize=8, frameon=False)
     fig.tight_layout(rect=(0, 0.06 if len(countries) > 1 else 0.12, 1, 1))
+    fig.savefig(f"{out}_detection_by_country.pdf")
+    fig.savefig(f"{out}_detection_by_country.png", dpi=200)
+
+
+def paired_deltas(raw):
+    """Per-sample change in HARISS detection time relative to the same sample's
+    baseline (corrected rates, main-analysis background, swab ratio 1:1). Each
+    sample's outbreak is shared across scenarios, so differences are paired.
+    Also returns AWW (CTT=1) time minus baseline HARISS time per sample."""
+    d = raw[raw.rate_set == "corrected"].copy()
+    d["hariss_c"] = censor(d.hariss_time, d.max_obs_time)
+    d["aww_c"] = censor(d.aww_ctt1_time, d.max_obs_time)
+    base_b = raw[raw.is_main_analysis].groupby("country").ed_ari_background.first()
+    d["base_b"] = d.country.map(base_b)
+    d["b_mult"] = d.ed_ari_background / d.base_b
+    base = d[(d.ed_ari_background == d.base_b) & (d.swab_ratio == 1)]
+    base = base.set_index(["country", "sample_id"]).hariss_c.rename("hariss_base")
+    d = d.join(base, on=["country", "sample_id"])
+    d["delta"] = d.hariss_c - d.hariss_base
+    d["aww_delta"] = d.aww_c - d.hariss_base
+    return d
+
+
+def plot_detection_delta(d, out):
+    """Pooled across countries: change in HARISS detection vs baseline.
+    Left: background ED ARI attendances (swab ratio 1:1). Right: swab ratio
+    (baseline background). Thin lines are individual countries' medians."""
+    q = lambda p: (lambda x: x.quantile(p))
+    panels = [
+        (d[d.swab_ratio == 1], "b_mult", "Background ED ARI attendances (relative to baseline)"),
+        (d[d.ed_ari_background == d.base_b], "swab_ratio", "Swab ratio, admitted : discharged (relative to baseline 1:1)"),
+    ]
+    aww = d.drop_duplicates(["country", "sample_id"]).aww_delta.median()
+    countries = list(dict.fromkeys(d.country))
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.8), sharey=True)
+    rows = []
+    for ax, (g, x, xlabel) in zip(axes, panels):
+        for country, gc in g.groupby("country", sort=False):
+            m = gc.groupby(x).delta.median()
+            ax.plot(m.index, m.values, color="grey", lw=0.8, alpha=0.6, zorder=1)
+        st = g.groupby(x).delta.agg(med="median", q25=q(0.25), q75=q(0.75)).reset_index()
+        st.insert(0, "factor", x)
+        rows.append(st)
+        line, = ax.plot(st[x], st.med, marker="o", color="tab:red", zorder=3,
+                        label=f"HARISS, pooled ({len(countries)} countries)")
+        ax.fill_between(st[x], st.q25, st.q75, color=line.get_color(), alpha=0.15, zorder=2)
+        ax.plot([], [], color="grey", lw=0.8, alpha=0.6, label="HARISS, individual countries")
+        ax.axhline(0, color="black", lw=0.8)
+        ax.axhline(aww, ls=":", color="green", label="AWW (CTT=1)")
+        ax.set_xscale("log")
+        ticks = sorted(set(st[x]))
+        ax.set_xticks(ticks, [_mult_label(t) for t in ticks])
+        ax.minorticks_off()
+        ax.set_xlabel(xlabel)
+    b = d.drop_duplicates(["country", "base_b"])
+    for name, est in UPDATED_ESTIMATES.items():
+        xm = (est / b.base_b).median()
+        axes[0].axvline(xm, color="lightgrey", lw=0.8, zorder=0)
+        axes[0].annotate(f"{name} estimate", (xm, 0), xycoords=("data", "axes fraction"),
+                         xytext=(-3, 4), textcoords="offset points", rotation=90,
+                         ha="right", va="bottom", fontsize=7, color="grey")
+    axes[0].set_ylabel("Change in HARISS detection time\nrelative to baseline (days)")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=3, fontsize=8, frameon=False)
+    fig.tight_layout(rect=(0, 0.1, 1, 1))
     fig.savefig(f"{out}_detection.pdf")
     fig.savefig(f"{out}_detection.png", dpi=200)
+    pd.concat(rows).to_csv(f"{out}_delta_summary.csv", index=False)
 
 
 def plot_heatmap(s, value, cbar_label, title, out_suffix, out, cmap):
@@ -154,12 +225,13 @@ def main():
     s = summarise(raw)
     s.to_csv(f"{out}_summary.csv", index=False)
     plot_detection(s, out, n_samples_per_week)
+    plot_detection_delta(paired_deltas(raw), out)
     plot_heatmap(s, "lead_ctt1", "AWW lead time (days)",
                  "Median AWW (CTT=1) lead time over earliest of ICU and HARISS",
                  "lead_time", out, "viridis")
     plot_heatmap(s, "hariss_med", "HARISS detection time (days)",
                  "Median HARISS detection time", "hariss_heatmap", out, "magma_r")
-    print(f"Wrote {out}_summary.csv and {out}_(detection|lead_time|hariss_heatmap).(pdf|png)")
+    print(f"Wrote {out}_summary.csv, {out}_delta_summary.csv and {out}_(detection|detection_by_country|lead_time|hariss_heatmap).(pdf|png)")
 
 
 if __name__ == "__main__":
